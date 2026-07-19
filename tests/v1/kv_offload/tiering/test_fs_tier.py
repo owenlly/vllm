@@ -10,6 +10,7 @@ data integrity throughout the process.
 
 import mmap
 import os
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -21,6 +22,11 @@ from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
+)
+from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
 )
 
 # ---------------------------------------------------------------------------
@@ -143,6 +149,47 @@ def fs_tier(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_thread_pool_wait_idle_waits_for_active_task():
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=0)
+    started = threading.Event()
+    release = threading.Event()
+    quiesced = threading.Event()
+
+    def blocking_task() -> None:
+        started.set()
+        release.wait(timeout=2)
+
+    def wait_for_idle() -> None:
+        pool.wait_idle()
+        quiesced.set()
+
+    try:
+        pool.enqueue_load(
+            job_id=1,
+            n_tasks=2,
+            tasks=[blocking_task, lambda: None],
+        )
+        assert started.wait(timeout=2)
+
+        waiter = threading.Thread(target=wait_for_idle)
+        waiter.start()
+        assert not quiesced.wait(timeout=0.05)
+
+        release.set()
+        assert quiesced.wait(timeout=2)
+        waiter.join(timeout=2)
+        assert not waiter.is_alive()
+
+        results = pool.get_finished()
+        assert len(results) == 1
+        assert results[0].job_id == 1
+        assert results[0].success
+        assert results[0].task_count == 2
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
 def test_lookup_empty_tier(fs_tier):
     tier, _ = fs_tier
     assert tier.lookup(key(1), _CTX) is False
@@ -159,6 +206,45 @@ def test_store_creates_file_and_lookup_succeeds(fs_tier):
     assert tier.lookup(key(1), _CTX) is True
     dest = tier.file_mapper.get_file_name(key(1))
     assert os.path.exists(dest), f"Expected file at {dest}"
+
+
+def test_quiesce_makes_submitted_jobs_reportable(fs_tier):
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
+
+    tier.quiesce()
+
+    results = list(tier.get_finished_jobs())
+    assert len(results) == 1
+    assert results[0].job_id == 1
+    assert results[0].success
+
+
+def test_tiering_reset_waits_for_filesystem_cascade(fs_tier):
+    tier, tensor = fs_tier
+    mmap_region = MagicMock()
+    mmap_region.create_kv_memoryview.return_value = memoryview(tensor.numpy())
+    primary = CPUPrimaryTierOffloadingManager(
+        num_blocks=4,
+        mmap_region=mmap_region,
+    )
+    manager = TieringOffloadingManager(primary, [tier])
+    blocks = [key(1), key(2)]
+
+    try:
+        result = manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        manager.complete_store(blocks, _CTX, success=True)
+
+        # The filesystem jobs may still be queued or active here. reset_cache
+        # must wait for them and drain their JobResult before reusing slots.
+        manager.reset_cache()
+
+        assert not manager._transfer_jobs
+        assert primary.get_usage_stats() == (0, 4)
+        assert all(tier.lookup(block, _CTX) is True for block in blocks)
+    finally:
+        primary.shutdown()
 
 
 def test_store_then_load_roundtrip(fs_tier):

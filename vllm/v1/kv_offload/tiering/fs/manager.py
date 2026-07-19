@@ -123,11 +123,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        primary_kv_view = self._primary_kv_view
+        assert primary_kv_view is not None
         tasks = (
             functools.partial(
                 store_block,
                 self.file_mapper.get_file_name(key),
-                self._primary_kv_view,
+                primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
             )
@@ -137,11 +139,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        primary_kv_view = self._primary_kv_view
+        assert primary_kv_view is not None
         tasks = (
             functools.partial(
                 load_block,
                 self.file_mapper.get_file_name(key),
-                self._primary_kv_view,
+                primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
             )
@@ -155,6 +159,11 @@ class FileSystemTierManager(SecondaryTierManager):
         Collect completed jobs from the finished-jobs queue.
         """
         return self._pool.get_finished()
+
+    @override
+    def quiesce(self) -> None:
+        """Wait until all submitted filesystem I/O can be polled as finished."""
+        self._pool.wait_idle()
 
     @override
     def shutdown(self) -> None:

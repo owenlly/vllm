@@ -18,14 +18,18 @@ import pytest
 import torch
 
 from vllm.v1.kv_offload.base import (
+    BlockIDsLoadStoreSpec,
     OffloadKey,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
     make_offload_key,
 )
-from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 from vllm.v1.kv_offload.tiering.base import JobResult
+from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -64,6 +68,43 @@ def count_hits(manager, keys: list[OffloadKey]) -> int | None:
     return count
 
 
+def assert_tiering_lookup_stats(
+    manager: TieringOffloadingManager,
+    expected_counters: dict[str, int],
+) -> None:
+    stats = manager.take_tiering_lookup_stats()
+    for tier in ("primary", "secondary", "total"):
+        for clock in ("wall", "cpu"):
+            runtime_key = f"{tier}_{clock}_seconds"
+            assert runtime_key in stats
+            assert stats.pop(runtime_key) >= 0.0
+    assert stats == expected_counters
+
+
+class _DPUBlockIDsLoadStoreSpec(BlockIDsLoadStoreSpec):
+    """Block-address spec standing in for a non-CPU primary tier."""
+
+    @staticmethod
+    def medium() -> str:
+        return "DPU"
+
+
+class _DPUPrimaryManager(CPUOffloadingManager):
+    """CPU policy mechanics with DPU-style worker-facing block metadata."""
+
+    def _get_load_store_spec(
+        self,
+        keys: Iterable[OffloadKey],
+        blocks: Iterable[BlockStatus],
+    ) -> _DPUBlockIDsLoadStoreSpec:
+        keys_list = list(keys)
+        blocks_list = list(blocks)
+        assert len(keys_list) == len(blocks_list)
+        return _DPUBlockIDsLoadStoreSpec(
+            [block.block_id for block in blocks_list]
+        )
+
+
 class TestExampleSecondaryTierManager:
     """Tests for ExampleSecondaryTierManager implementation."""
 
@@ -91,6 +132,51 @@ class TestExampleSecondaryTierManager:
 
         # Third block not present
         assert tier.lookup(blocks[2], _CTX) is False
+
+    def test_factory_accepts_primary_without_memoryview(self):
+        tier = SecondaryTierFactory.create_secondary_tier(
+            tier_config={"type": "example"},
+            primary_kv_view=None,
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+        )
+
+        assert isinstance(tier, ExampleSecondaryTierManager)
+        assert tier._primary_kv_view is None
+
+
+def test_block_id_primary_supports_cascade_promotion_and_reset():
+    """Tiering only requires BlockIDsLoadStoreSpec, not CPU-specific specs."""
+    primary = _DPUPrimaryManager(num_blocks=3)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    assert isinstance(secondary, ExampleSecondaryTierManager)
+    secondary.quiesce = MagicMock(wraps=secondary.quiesce)
+    secondary.reset_cache = MagicMock(wraps=secondary.reset_cache)
+    manager = TieringOffloadingManager(primary, [secondary])
+    blocks = to_keys(range(2))
+
+    store_output = manager.prepare_store(blocks, _CTX)
+    assert store_output is not None
+    assert isinstance(store_output.store_spec, _DPUBlockIDsLoadStoreSpec)
+    assert store_output.store_spec.block_ids.tolist() == [0, 1]
+    manager.complete_store(blocks, _CTX, success=True)
+
+    # reset_cache drains the completed cascade before primary block IDs are
+    # released. Persistent secondary data remains available for promotion.
+    manager.reset_cache()
+    secondary.quiesce.assert_called_once_with()
+    secondary.reset_cache.assert_called_once_with()
+    assert all(primary.lookup(block, _CTX) is False for block in blocks)
+    assert all(secondary.lookup(block, _CTX) is True for block in blocks)
+
+    assert all(manager.lookup(block, _CTX) is None for block in blocks)
+    manager.on_schedule_end()  # submit the batched promotion
+    manager.on_schedule_end()  # consume its immediate completion
+
+    assert all(primary.lookup(block, _CTX) is True for block in blocks)
 
 
 class TestTieringOffloadingManager:
@@ -357,15 +443,18 @@ class TestTieringOffloadingManager:
         assert self.manager.lookup(missing, _CTX) is False
         assert self.manager.lookup(secondary_hit, _CTX) is None
 
-        assert self.manager.take_tiering_lookup_stats() == {
-            "total_blocks": 4,
-            "cpu_lookup_blocks": 4,
-            "cpu_hit_ready_blocks": 1,
-            "cpu_hit_pending_blocks": 1,
-            "secondary_lookup_blocks": 3,
-            "secondary_hit_ready_blocks": 1,
-            "miss_blocks": 1,
-        }
+        assert_tiering_lookup_stats(
+            self.manager,
+            {
+                "total_blocks": 4,
+                "cpu_lookup_blocks": 4,
+                "cpu_hit_ready_blocks": 1,
+                "cpu_hit_pending_blocks": 1,
+                "secondary_lookup_blocks": 3,
+                "secondary_hit_ready_blocks": 1,
+                "miss_blocks": 1,
+            },
+        )
         assert self.manager.take_tiering_lookup_stats() == {}
 
     def test_tiering_lookup_stats_track_secondary_pending(self, manager_setup):
@@ -376,12 +465,15 @@ class TestTieringOffloadingManager:
 
         assert self.manager.lookup(block, _CTX) is None
 
-        assert self.manager.take_tiering_lookup_stats() == {
-            "total_blocks": 1,
-            "cpu_lookup_blocks": 1,
-            "secondary_lookup_blocks": 2,
-            "secondary_hit_pending_blocks": 1,
-        }
+        assert_tiering_lookup_stats(
+            self.manager,
+            {
+                "total_blocks": 1,
+                "cpu_lookup_blocks": 1,
+                "secondary_lookup_blocks": 2,
+                "secondary_hit_pending_blocks": 1,
+            },
+        )
 
     def test_tiering_lookup_stats_track_pending_before_later_hit(
         self, manager_setup
@@ -393,13 +485,16 @@ class TestTieringOffloadingManager:
 
         assert self.manager.lookup(block, _CTX) is None
 
-        assert self.manager.take_tiering_lookup_stats() == {
-            "total_blocks": 1,
-            "cpu_lookup_blocks": 1,
-            "secondary_lookup_blocks": 2,
-            "secondary_hit_pending_blocks": 1,
-            "secondary_hit_ready_blocks": 1,
-        }
+        assert_tiering_lookup_stats(
+            self.manager,
+            {
+                "total_blocks": 1,
+                "cpu_lookup_blocks": 1,
+                "secondary_lookup_blocks": 2,
+                "secondary_hit_pending_blocks": 1,
+                "secondary_hit_ready_blocks": 1,
+            },
+        )
 
     def test_tiering_lookup_stats_track_no_primary_slot(self, manager_setup):
         """Secondary hit without an evictable primary slot is not a miss."""
@@ -413,12 +508,15 @@ class TestTieringOffloadingManager:
 
         assert self.manager.lookup(secondary_only_block, _CTX) is False
 
-        assert self.manager.take_tiering_lookup_stats() == {
-            "total_blocks": 1,
-            "cpu_lookup_blocks": 1,
-            "secondary_lookup_blocks": 1,
-            "secondary_hit_but_no_primary_slot_blocks": 1,
-        }
+        assert_tiering_lookup_stats(
+            self.manager,
+            {
+                "total_blocks": 1,
+                "cpu_lookup_blocks": 1,
+                "secondary_lookup_blocks": 1,
+                "secondary_hit_but_no_primary_slot_blocks": 1,
+            },
+        )
 
     def test_primary_eviction_stats_track_store_evictions(self, manager_setup):
         """Primary eviction counters include GPU-to-primary store evictions."""
@@ -513,7 +611,7 @@ class TestTieringOffloadingManager:
         assert len(self.secondary_tier2.completed_jobs) > 0
 
         # End of step 2: flag was reset, so _maybe_process_finished_jobs()
-        # runs and processes the cascade completions (complete_read → ref_cnt--)
+        # runs and processes the cascade completions (complete_load → ref_cnt--)
         self._simulate_on_schedule_end()
 
         # After cascade completes, ref_cnt should be 0
@@ -638,6 +736,46 @@ class TestTieringOffloadingManager:
         # submit_store was never called on either secondary tier
         self.secondary_tier1.submit_store.assert_not_called()
         self.secondary_tier2.submit_store.assert_not_called()
+
+    def test_reset_cache_aborts_deferred_promotions(self, manager_setup):
+        block = to_keys([99])[0]
+        self.secondary_tier1.blocks[block] = True
+
+        assert self.manager.lookup(block, _CTX) is None
+        assert self.primary_tier.lookup(block, _CTX) is None
+        assert self.manager._pending_load_submissions
+
+        self.manager.reset_cache()
+
+        assert not self.manager._pending_load_submissions
+        assert self.primary_tier.lookup(block, _CTX) is False
+
+    def test_reset_cache_rejects_unquiesced_secondary_job(self, manager_setup):
+        block = to_keys([1])[0]
+        # This tier accepts the store but never reports its completion.
+        self.secondary_tier1.submit_store = MagicMock()
+
+        result = self.manager.prepare_store([block], _CTX)
+        assert result is not None
+        self.manager.complete_store([block], _CTX, success=True)
+
+        with pytest.raises(RuntimeError, match="secondary jobs remain in flight"):
+            self.manager.reset_cache()
+
+        # The slot remains allocated and pinned by the unfinished transfer;
+        # reset must not make its block ID available for reuse.
+        assert self.primary_tier.lookup(block, _CTX) is True
+        assert self.primary_tier._policy.get(block).ref_cnt == 1
+        assert len(self.manager._transfer_jobs) == 1
+
+        # The retained job can still finish, after which a retry is safe.
+        job_id = next(iter(self.manager._transfer_jobs))
+        self.secondary_tier1.completed_jobs.append(
+            JobResult(job_id=job_id, success=True)
+        )
+        self.manager.reset_cache()
+        assert not self.manager._transfer_jobs
+        assert self.primary_tier.get_usage_stats() == (0, 5)
 
     def test_lookup_batches_submit_load_per_request(self, manager_setup):
         """lookup() defers submit_load until on_schedule_end(), one per request.
@@ -820,6 +958,9 @@ class TestTieringOffloadingWithoutSecondaryTiers:
         manager.complete_store(blocks, _CTX, success=True)
 
         assert count_hits(manager, blocks) == 3
+
+        manager.reset_cache()
+        assert count_hits(manager, blocks) == 0
 
 
 if __name__ == "__main__":

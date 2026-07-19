@@ -28,7 +28,7 @@ class SecondaryTierFactory:
     def create_secondary_tier(
         cls,
         tier_config: dict,
-        primary_kv_view: memoryview,
+        primary_kv_view: memoryview | None,
         offloading_spec: "OffloadingSpec",
     ) -> SecondaryTierManager:
         config = tier_config.copy()

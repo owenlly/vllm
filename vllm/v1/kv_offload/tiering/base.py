@@ -47,31 +47,35 @@ class SecondaryTierManager(ABC):
     """
     Abstract interface for managing a single non-primary offloading tier.
 
-    Secondary tiers cannot directly access GPU memory. All data transfers
-    must go through the CPU (primary) tier:
-      - Store: GPU → CPU (primary) → secondary  (cascade)
-      - Load:  secondary → CPU (primary) → GPU  (promotion)
+    Secondary tiers exchange data through primary-tier block slots. The
+    primary tier is the gateway to the worker-visible KV cache, but it need
+    not be CPU-backed:
+      - Store: worker KV cache → primary → secondary  (cascade)
+      - Load:  secondary → primary → worker KV cache  (promotion)
 
-    IMPORTANT: All methods run in the Scheduler process and must be
-    lightweight and non-blocking. submit_load() and submit_store() submit
-    async jobs; get_finished_jobs() polls for completion.
+    IMPORTANT: Normal scheduling methods run in the Scheduler process and must
+    be lightweight and non-blocking. submit_load() and submit_store() submit
+    async jobs; get_finished_jobs() polls for completion. quiesce() is the
+    reset-only synchronization hook and may wait for submitted jobs.
     """
 
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_kv_view: memoryview | None,
         tier_type: str,
     ) -> None:
         """
         Args:
             offloading_spec: Offloading configuration.
-            primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+            primary_kv_view: Optional scheduler-local memoryview of the
+                primary tier. CPU-backed secondary implementations can use it
+                for direct I/O; address-only primary tiers pass None.
             tier_type: Tier type identifier, set by SecondaryTierFactory
                 from the registered tier type.
         """
         self._offloading_spec = offloading_spec
-        self._primary_kv_view: memoryview = primary_kv_view
+        self._primary_kv_view: memoryview | None = primary_kv_view
         self.tier_type = tier_type
 
     @abstractmethod
@@ -194,6 +198,26 @@ class SecondaryTierManager(ABC):
 
         Secondary tiers may override this for per-step cleanup or
         deferred work submission.
+        """
+        return
+
+    def quiesce(self) -> None:
+        """Wait until previously submitted jobs can be reported as finished.
+
+        Tiers with background transfers should override this hook. The default
+        is appropriate for synchronous tiers and preserves compatibility with
+        existing implementations. After this method returns, the orchestrator
+        polls ``get_finished_jobs()`` and verifies that no jobs remain before
+        reusing primary-tier slots during a cache reset.
+        """
+        return
+
+    def reset_cache(self) -> None:
+        """Reset tier-local cache state after outstanding jobs are quiesced.
+
+        Persistent tiers may intentionally keep their data and use the default
+        no-op. Tiers that track an in-memory index or own evictable storage can
+        override this hook.
         """
         return
 

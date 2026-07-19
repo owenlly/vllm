@@ -90,6 +90,7 @@ class DualQueueThreadPool:
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
+        self._active_tasks = 0
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[JobResult] = deque()
 
@@ -140,10 +141,19 @@ class DualQueueThreadPool:
             self._condition.notify(n_tasks)
 
     def get_finished(self) -> list[JobResult]:
-        jobs = []
-        while self._finished_q:
-            jobs.append(self._finished_q.popleft())
-        return jobs
+        with self._condition:
+            jobs = list(self._finished_q)
+            self._finished_q.clear()
+            return jobs
+
+    def wait_idle(self) -> None:
+        """Wait for all queued and currently executing tasks to finish."""
+        with self._condition:
+            self._condition.wait_for(
+                lambda: not self._load_q
+                and not self._store_q
+                and self._active_tasks == 0
+            )
 
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
@@ -167,6 +177,7 @@ class DualQueueThreadPool:
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+                self._active_tasks += 1
             wall_start = time.perf_counter()
             cpu_start = time.thread_time()
             success = True
@@ -186,5 +197,13 @@ class DualQueueThreadPool:
                     success, task_cpu_s, task_wall_s
                 )
 
-            if job_finished:
-                self._finished_q.append(state.result())
+            with self._condition:
+                if job_finished:
+                    self._finished_q.append(state.result())
+                self._active_tasks -= 1
+                if (
+                    not self._load_q
+                    and not self._store_q
+                    and self._active_tasks == 0
+                ):
+                    self._condition.notify_all()
