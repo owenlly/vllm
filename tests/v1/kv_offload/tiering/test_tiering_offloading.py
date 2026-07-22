@@ -260,6 +260,68 @@ class TestTieringOffloadingManager:
         assert all(self.secondary_tier1.lookup(b, _CTX) for b in blocks)
         assert all(self.secondary_tier2.lookup(b, _CTX) for b in blocks)
 
+    def test_cascade_filters_before_pinning_primary_blocks(self, manager_setup):
+        """Known secondary hits are excluded before prepare_load pins slots."""
+        blocks = to_keys(range(3))
+        keys_to_store = (blocks[1],)
+        self.secondary_tier1.filter_store_keys = MagicMock(
+            return_value=keys_to_store
+        )
+        self.secondary_tier1.submit_store = MagicMock(
+            wraps=self.secondary_tier1.submit_store
+        )
+
+        result = self.manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(blocks, _CTX, success=True)
+
+        self.secondary_tier1.filter_store_keys.assert_called_once_with(
+            blocks, _CTX
+        )
+        job_metadata = self.secondary_tier1.submit_store.call_args.args[0]
+        assert tuple(job_metadata.keys) == keys_to_store
+
+        # tier1 pins only block 1; tier2 still pins every block.
+        assert self.primary_tier._policy.get(blocks[0]).ref_cnt == 1
+        assert self.primary_tier._policy.get(blocks[1]).ref_cnt == 2
+        assert self.primary_tier._policy.get(blocks[2]).ref_cnt == 1
+        assert self.manager.take_secondary_tier_stats() == {
+            "store": {
+                "candidate_blocks": 6,
+                "skipped_present_blocks": 2,
+                "submitted_jobs": 2,
+                "submitted_blocks": 4,
+            }
+        }
+
+    def test_cascade_does_not_create_job_when_all_keys_are_filtered(
+        self, manager_setup
+    ):
+        """An all-hit secondary tier creates no empty job or primary pin."""
+        blocks = to_keys(range(3))
+        self.secondary_tier1.filter_store_keys = MagicMock(return_value=())
+        self.secondary_tier1.submit_store = MagicMock(
+            wraps=self.secondary_tier1.submit_store
+        )
+
+        result = self.manager.prepare_store(blocks, _CTX)
+        assert result is not None
+        self.manager.complete_store(blocks, _CTX, success=True)
+
+        self.secondary_tier1.submit_store.assert_not_called()
+        assert all(
+            self.primary_tier._policy.get(block).ref_cnt == 1
+            for block in blocks
+        )
+        assert self.manager.take_secondary_tier_stats() == {
+            "store": {
+                "candidate_blocks": 6,
+                "skipped_present_blocks": 3,
+                "submitted_jobs": 1,
+                "submitted_blocks": 3,
+            }
+        }
+
     def test_secondary_tier_stats_track_store_jobs(self, manager_setup):
         """Secondary tier store counters are emitted as deltas."""
         blocks = to_keys(range(3))
@@ -270,6 +332,7 @@ class TestTieringOffloadingManager:
 
         assert self.manager.take_secondary_tier_stats() == {
             "store": {
+                "candidate_blocks": 6,
                 "submitted_jobs": 2,
                 "submitted_blocks": 6,
             }
@@ -915,6 +978,9 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.submit_store = MagicMock(
             wraps=self.secondary_tier1.submit_store
         )
+        self.secondary_tier1.filter_store_keys = MagicMock(
+            wraps=self.secondary_tier1.filter_store_keys
+        )
         self.secondary_tier2.submit_store = MagicMock(
             wraps=self.secondary_tier2.submit_store
         )
@@ -931,6 +997,9 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.submit_store.assert_called_once()
         job_metadata = self.secondary_tier1.submit_store.call_args.args[0]
         assert set(job_metadata.keys) == set(existing_blocks)
+        self.secondary_tier1.filter_store_keys.assert_called_once_with(
+            tuple(existing_blocks), ctx
+        )
 
         # tier2 (block-level) does not get existing blocks here.
         self.secondary_tier2.submit_store.assert_not_called()

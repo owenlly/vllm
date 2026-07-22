@@ -104,6 +104,8 @@ def test_aggregate_secondary_tier_stats():
     stats1.record_secondary_tier_stats(
         {
             "store": {
+                "candidate_blocks": 10,
+                "skipped_present_blocks": 4,
                 "submitted_jobs": 2,
                 "submitted_blocks": 6,
                 "succeeded_jobs": 1,
@@ -135,6 +137,8 @@ def test_aggregate_secondary_tier_stats():
     reduced = stats1.aggregate(stats2).reduce()
 
     assert reduced["secondary_tier_store_submitted_jobs"] == 2
+    assert reduced["secondary_tier_store_candidate_blocks"] == 10
+    assert reduced["secondary_tier_store_skipped_present_blocks"] == 4
     assert reduced["secondary_tier_store_submitted_blocks"] == 6
     assert reduced["secondary_tier_store_succeeded_jobs"] == 2
     assert reduced["secondary_tier_store_succeeded_blocks"] == 6

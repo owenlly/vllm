@@ -198,7 +198,32 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> None:
         stats = self._secondary_tier_stats[operation]
         stats[f"{status}_jobs"] += 1
-        stats[f"{status}_blocks"] += block_count
+        self._record_secondary_tier_blocks(operation, status, block_count)
+
+    def _record_secondary_tier_blocks(
+        self, operation: str, status: str, block_count: int
+    ) -> None:
+        if block_count <= 0:
+            return
+        self._secondary_tier_stats[operation][f"{status}_blocks"] += block_count
+
+    def _filter_secondary_store_keys(
+        self,
+        tier: SecondaryTierManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> tuple[OffloadKey, ...]:
+        """Filter durable keys and account for early STORE deduplication."""
+        candidate_count = len(keys)
+        self._record_secondary_tier_blocks("store", "candidate", candidate_count)
+        store_keys = tier.filter_store_keys(keys, req_context)
+        skipped_count = candidate_count - len(store_keys)
+        if skipped_count < 0:
+            raise ValueError("filter_store_keys returned more keys than it received")
+        self._record_secondary_tier_blocks(
+            "store", "skipped_present", skipped_count
+        )
+        return store_keys
 
     def _record_secondary_tier_job_latency(
         self, operation: str, status: str, latency_s: float
@@ -679,15 +704,20 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier in request_level_tiers:
+            store_keys = self._filter_secondary_store_keys(
+                tier, ready_keys, req_context
+            )
+            if not store_keys:
+                continue
             primary_blocks_spec = self.primary_tier.prepare_load(
-                ready_keys, req_context
+                store_keys, req_context
             )
 
             job_id = self._next_job_id()
             assert isinstance(primary_blocks_spec, BlockIDsLoadStoreSpec)
             job_metadata = JobMetadata(
                 job_id=job_id,
-                keys=ready_keys,
+                keys=store_keys,
                 block_ids=primary_blocks_spec.block_ids,
                 is_promotion=False,
                 req_context=req_context,
@@ -696,7 +726,7 @@ class TieringOffloadingManager(OffloadingManager):
             self._transfer_jobs[job_id] = job_metadata
             tier.submit_store(job_metadata)
             self._record_secondary_tier_job(
-                "store", "submitted", len(ready_keys)
+                "store", "submitted", len(store_keys)
             )
 
     @override
@@ -714,10 +744,11 @@ class TieringOffloadingManager(OffloadingManager):
         secondary tiers.
 
         For each secondary tier:
-        1. Call primary.prepare_load() to get LoadStoreSpec AND increment
+        1. Filter out keys known to be present before pinning primary slots
+        2. Call primary.prepare_load() to get LoadStoreSpec AND increment
            ref_cnt (protecting blocks during async transfer)
-        2. Call tier.submit_store() to start async transfer: primary→secondary
-        3. Track the job in _store_jobs dictionary
+        3. Call tier.submit_store() to start async transfer: primary→secondary
+        4. Track the job in _store_jobs dictionary
 
         Args:
             keys: Blocks that finished storing.
@@ -732,12 +763,17 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         # Step 2: Cascade to ALL secondary tiers
-        # For each secondary tier, call primary.prepare_load() to get the
-        # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
-        # eviction during the async transfer). One prepare_load() call per
-        # secondary tier.
+        # For each secondary tier, filter known hits before calling
+        # primary.prepare_load(). This avoids pinning primary blocks for
+        # secondary data that is already durable. One prepare_load() call per
+        # secondary tier that still has keys to store.
         for tier in self.secondary_tiers:
-            primary_blocks_spec = self.primary_tier.prepare_load(keys, req_context)
+            store_keys = self._filter_secondary_store_keys(tier, keys, req_context)
+            if not store_keys:
+                continue
+            primary_blocks_spec = self.primary_tier.prepare_load(
+                store_keys, req_context
+            )
 
             # Submit async store job: primary→secondary
             job_id = self._next_job_id()
@@ -746,7 +782,7 @@ class TieringOffloadingManager(OffloadingManager):
             assert isinstance(primary_blocks_spec, BlockIDsLoadStoreSpec)
             job_metadata = JobMetadata(
                 job_id=job_id,
-                keys=keys,
+                keys=store_keys,
                 block_ids=primary_blocks_spec.block_ids,
                 is_promotion=False,
                 req_context=req_context,
@@ -755,7 +791,9 @@ class TieringOffloadingManager(OffloadingManager):
             self._transfer_jobs[job_id] = job_metadata
 
             tier.submit_store(job_metadata)
-            self._record_secondary_tier_job("store", "submitted", len(keys))
+            self._record_secondary_tier_job(
+                "store", "submitted", len(store_keys)
+            )
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().

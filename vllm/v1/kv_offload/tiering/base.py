@@ -94,6 +94,26 @@ class SecondaryTierManager(ABC):
         """
         pass
 
+    def filter_store_keys(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> tuple[OffloadKey, ...]:
+        """Return keys that still require a secondary-tier store.
+
+        The tiering orchestrator calls this hook before pinning primary-tier
+        blocks for a STORE job. Implementations may use scheduler-local
+        presence metadata to exclude keys that are definitively present and
+        ready in this tier. The hook must be lightweight and non-blocking;
+        unknown or pending keys must remain in the returned collection.
+
+        The default keeps every key, preserving the behavior of secondary
+        tiers that do not maintain local presence metadata. ``submit_store``
+        must still defensively handle already-present keys because callers
+        may bypass this optimization or state may change before submission.
+        """
+        return tuple(keys)
+
     @abstractmethod
     def submit_store(self, job_metadata: JobMetadata) -> None:
         """
@@ -109,7 +129,7 @@ class SecondaryTierManager(ABC):
             (ref-counted) for the duration of the transfer.
 
         The implementation is responsible for:
-          1. Filtering out blocks already present in this tier
+          1. Defensively filtering out blocks already present in this tier
           2. Evicting blocks if capacity is needed
           3. Allocating space in this tier
           4. Submitting the async transfer (read from primary via block_ids)
