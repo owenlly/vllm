@@ -137,6 +137,8 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
+        profile_block_lookup: bool = True,
+        profile_job_breakdown: bool = True,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -146,9 +148,18 @@ class TieringOffloadingManager(OffloadingManager):
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
             enable_events: Whether to track offloading events
+            profile_block_lookup: Whether to record per-block lookup runtimes.
+            profile_job_breakdown: Whether to correlate secondary promotions
+                with the subsequent primary-to-GPU load.
         """
+        if not isinstance(profile_block_lookup, bool):
+            raise TypeError("profile_block_lookup must be a boolean")
+        if not isinstance(profile_job_breakdown, bool):
+            raise TypeError("profile_job_breakdown must be a boolean")
         self.primary_tier: CPUOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self.profile_block_lookup = profile_block_lookup
+        self.profile_job_breakdown = profile_job_breakdown
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -409,7 +420,7 @@ class TieringOffloadingManager(OffloadingManager):
                         status,
                         len(job_metadata.keys),
                     )
-                    if completed_job.success:
+                    if completed_job.success and self.profile_job_breakdown:
                         req_id = job_metadata.req_context.req_id
                         previous = self._completed_promotion_timings.get(req_id)
                         submitted_at_s = job_metadata.submitted_at_s
@@ -485,21 +496,23 @@ class TieringOffloadingManager(OffloadingManager):
                     and cannot accept a promotion.
         """
         self._record_tiering_lookup_total()
-        total_wall_start = time.perf_counter()
-        total_cpu_start = time.thread_time()
+        profile_lookup = self.profile_block_lookup
+        total_wall_start = time.perf_counter() if profile_lookup else 0.0
+        total_cpu_start = time.thread_time() if profile_lookup else 0.0
         try:
             self._maybe_process_finished_jobs()
 
-            primary_wall_start = time.perf_counter()
-            primary_cpu_start = time.thread_time()
+            primary_wall_start = time.perf_counter() if profile_lookup else 0.0
+            primary_cpu_start = time.thread_time() if profile_lookup else 0.0
             try:
                 primary_hit = self.primary_tier.lookup(key, req_context)
             finally:
-                self._record_tiering_lookup_runtime(
-                    "primary",
-                    wall_s=time.perf_counter() - primary_wall_start,
-                    cpu_s=time.thread_time() - primary_cpu_start,
-                )
+                if profile_lookup:
+                    self._record_tiering_lookup_runtime(
+                        "primary",
+                        wall_s=time.perf_counter() - primary_wall_start,
+                        cpu_s=time.thread_time() - primary_cpu_start,
+                    )
 
             self._record_tiering_lookup_result("cpu_lookup")
             if primary_hit is True:
@@ -511,16 +524,21 @@ class TieringOffloadingManager(OffloadingManager):
 
             any_none = False
             for tier in self.secondary_tiers:
-                secondary_wall_start = time.perf_counter()
-                secondary_cpu_start = time.thread_time()
+                secondary_wall_start = (
+                    time.perf_counter() if profile_lookup else 0.0
+                )
+                secondary_cpu_start = (
+                    time.thread_time() if profile_lookup else 0.0
+                )
                 try:
                     result = tier.lookup(key, req_context)
                 finally:
-                    self._record_tiering_lookup_runtime(
-                        "secondary",
-                        wall_s=time.perf_counter() - secondary_wall_start,
-                        cpu_s=time.thread_time() - secondary_cpu_start,
-                    )
+                    if profile_lookup:
+                        self._record_tiering_lookup_runtime(
+                            "secondary",
+                            wall_s=time.perf_counter() - secondary_wall_start,
+                            cpu_s=time.thread_time() - secondary_cpu_start,
+                        )
 
                 self._record_tiering_lookup_result("secondary_lookup")
                 if result is True:
@@ -540,11 +558,12 @@ class TieringOffloadingManager(OffloadingManager):
             self._record_tiering_lookup_result("miss")
             return False
         finally:
-            self._record_tiering_lookup_runtime(
-                "total",
-                wall_s=time.perf_counter() - total_wall_start,
-                cpu_s=time.thread_time() - total_cpu_start,
-            )
+            if profile_lookup:
+                self._record_tiering_lookup_runtime(
+                    "total",
+                    wall_s=time.perf_counter() - total_wall_start,
+                    cpu_s=time.thread_time() - total_cpu_start,
+                )
 
     def _initiate_promotion(
         self,

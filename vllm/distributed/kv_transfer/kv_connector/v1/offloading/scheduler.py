@@ -271,6 +271,9 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        self._profile_job_breakdown = bool(
+            getattr(spec, "profile_job_breakdown", True)
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -326,8 +329,12 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _start_primary_to_gpu_timing(
-        self, req_id: str
+        self,
+        req_id: str,
+        prepare_load_started_at_s: float,
+        prepare_load_completed_at_s: float,
     ) -> tuple[float, float | None]:
+        assert getattr(self, "_profile_job_breakdown", True)
         submitted_at_s = time.monotonic()
         external_load_started_at_s: float | None = None
         take_promotion_timing = getattr(
@@ -351,11 +358,37 @@ class OffloadingConnectorScheduler:
                 self._external_load_stage_latency_stats["scheduler_gap"].append(
                     max(submitted_at_s - promotion_timing.ready_at_s, 0.0)
                 )
+                self._external_load_stage_latency_stats[
+                    "scheduler_revisit_wait"
+                ].append(
+                    max(
+                        prepare_load_started_at_s - promotion_timing.ready_at_s,
+                        0.0,
+                    )
+                )
+                self._external_load_stage_latency_stats[
+                    "scheduler_prepare_load"
+                ].append(
+                    max(
+                        prepare_load_completed_at_s - prepare_load_started_at_s,
+                        0.0,
+                    )
+                )
+                self._external_load_stage_latency_stats[
+                    "scheduler_build_load_spec"
+                ].append(
+                    max(
+                        submitted_at_s - prepare_load_completed_at_s,
+                        0.0,
+                    )
+                )
         return submitted_at_s, external_load_started_at_s
 
     def _record_primary_to_gpu_completion(
         self, job_status: TransferJobStatus
     ) -> None:
+        if not getattr(self, "_profile_job_breakdown", True):
+            return
         completed_at_s = time.monotonic()
         assert job_status.primary_to_gpu_submitted_at_s is not None
         self._external_load_stage_latency_stats["primary_to_gpu"].append(
@@ -700,15 +733,31 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
 
+        prepare_load_started_at_s = (
+            time.monotonic() if self._profile_job_breakdown else None
+        )
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        prepare_load_completed_at_s = (
+            time.monotonic() if self._profile_job_breakdown else None
+        )
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
-        (
-            primary_to_gpu_submitted_at_s,
-            external_load_started_at_s,
-        ) = self._start_primary_to_gpu_timing(request.request_id)
+        if self._profile_job_breakdown:
+            assert prepare_load_started_at_s is not None
+            assert prepare_load_completed_at_s is not None
+            (
+                primary_to_gpu_submitted_at_s,
+                external_load_started_at_s,
+            ) = self._start_primary_to_gpu_timing(
+                request.request_id,
+                prepare_load_started_at_s,
+                prepare_load_completed_at_s,
+            )
+        else:
+            primary_to_gpu_submitted_at_s = None
+            external_load_started_at_s = None
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -1134,6 +1183,11 @@ class OffloadingConnectorScheduler:
         if hasattr(self.manager, "take_primary_eviction_stats"):
             primary_eviction_stats = self.manager.take_primary_eviction_stats()
             stats.record_primary_eviction_stats(primary_eviction_stats)
+        if hasattr(self.manager, "take_external_load_stage_latency_stats"):
+            host_latency_stats = (
+                self.manager.take_external_load_stage_latency_stats()
+            )
+            stats.record_external_load_stage_latency_stats(host_latency_stats)
         if self._external_load_stage_latency_stats:
             stats.record_external_load_stage_latency_stats(
                 {

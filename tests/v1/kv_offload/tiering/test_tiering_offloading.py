@@ -525,6 +525,19 @@ class TestTieringOffloadingManager:
         )
         assert self.manager.take_tiering_lookup_stats() == {}
 
+    def test_tiering_lookup_runtime_stats_can_be_disabled(self, manager_setup):
+        self.manager.profile_block_lookup = False
+        missing = to_keys([99])[0]
+
+        assert self.manager.lookup(missing, _CTX) is False
+
+        stats = self.manager.take_tiering_lookup_stats()
+        assert stats["total_blocks"] == 1
+        assert stats["cpu_lookup_blocks"] == 1
+        assert stats["secondary_lookup_blocks"] == 2
+        assert stats["miss_blocks"] == 1
+        assert not any(name.endswith("_seconds") for name in stats)
+
     def test_tiering_lookup_stats_track_secondary_pending(self, manager_setup):
         """A pending secondary-tier lookup is counted separately."""
         block = to_keys([99])[0]

@@ -189,7 +189,11 @@ def test_external_load_stage_latency_tracks_request_critical_path():
         side_effect=[2.25, 2.75],
     ):
         submitted_at_s, external_started_at_s = (
-            scheduler._start_primary_to_gpu_timing("request")
+            scheduler._start_primary_to_gpu_timing(
+                "request",
+                prepare_load_started_at_s=2.0625,
+                prepare_load_completed_at_s=2.125,
+            )
         )
         scheduler._record_primary_to_gpu_completion(
             TransferJobStatus(
@@ -205,8 +209,54 @@ def test_external_load_stage_latency_tracks_request_critical_path():
     assert scheduler._external_load_stage_latency_stats == {
         "secondary_to_primary": [1.0],
         "scheduler_gap": [0.25],
+        "scheduler_revisit_wait": [0.0625],
+        "scheduler_prepare_load": [0.0625],
+        "scheduler_build_load_spec": [0.125],
         "primary_to_gpu": [0.5],
         "end_to_end": [1.75],
+    }
+
+
+def test_external_load_stage_latency_can_be_disabled():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = False
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic"
+    ) as monotonic:
+        scheduler._record_primary_to_gpu_completion(
+            TransferJobStatus(
+                req_id="request",
+                pending_count=0,
+                keys=set(),
+                is_store=False,
+            )
+        )
+
+    monotonic.assert_not_called()
+    assert scheduler._external_load_stage_latency_stats == {}
+
+
+def test_external_load_host_latency_stats_are_exported():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace(
+        take_external_load_stage_latency_stats=lambda: {
+            "secondary_rank0_rpc": [0.2],
+            "secondary_host_poll_delay": [0.05],
+        }
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "external_load_secondary_rank0_rpc_latency_count": 1,
+        "external_load_secondary_rank0_rpc_latency_sum": 0.2,
+        "external_load_secondary_host_poll_delay_latency_count": 1,
+        "external_load_secondary_host_poll_delay_latency_sum": 0.05,
     }
 
 
