@@ -459,6 +459,11 @@ class TestTieringOffloadingManager:
             }
         }
         assert self.manager.take_secondary_tier_job_latency_stats() == {}
+        timing = self.manager.take_completed_promotion_timing(_CTX.req_id)
+        assert timing is not None
+        assert timing.submitted_at_s == 30.0
+        assert timing.ready_at_s == 31.25
+        assert self.manager.take_completed_promotion_timing(_CTX.req_id) is None
 
     def test_secondary_tier_task_runtime_stats_track_promotion_jobs(
         self, manager_setup

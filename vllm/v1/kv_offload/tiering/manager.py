@@ -61,6 +61,14 @@ class PendingPromotion:
     block_ids: list[int] = field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedPromotionTiming:
+    """Request-visible timing for a completed secondary promotion."""
+
+    submitted_at_s: float
+    ready_at_s: float
+
+
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     """CPUOffloadingManager with a primary/secondary transfer interface.
 
@@ -186,6 +194,13 @@ class TieringOffloadingManager(OffloadingManager):
         self._primary_eviction_stats: defaultdict[str, defaultdict[str, int]] = (
             defaultdict(lambda: defaultdict(int))
         )
+        # Successful secondary promotions are correlated with the subsequent
+        # primary-to-GPU LOAD by request ID. If a request ever needs multiple
+        # promotion jobs, its visible wait starts at the first submission and
+        # ends when the last promotion becomes ready.
+        self._completed_promotion_timings: dict[
+            str, CompletedPromotionTiming
+        ] = {}
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -371,6 +386,7 @@ class TieringOffloadingManager(OffloadingManager):
         """
         for i, tier in enumerate(self.secondary_tiers):
             for completed_job in tier.get_finished_jobs():
+                completed_at_s = time.monotonic()
                 job_id = completed_job.job_id
                 job_metadata = self._transfer_jobs.pop(job_id, None)
                 assert job_metadata is not None, (
@@ -393,6 +409,26 @@ class TieringOffloadingManager(OffloadingManager):
                         status,
                         len(job_metadata.keys),
                     )
+                    if completed_job.success:
+                        req_id = job_metadata.req_context.req_id
+                        previous = self._completed_promotion_timings.get(req_id)
+                        submitted_at_s = job_metadata.submitted_at_s
+                        if previous is not None:
+                            submitted_at_s = min(
+                                submitted_at_s,
+                                previous.submitted_at_s,
+                            )
+                        self._completed_promotion_timings[req_id] = (
+                            CompletedPromotionTiming(
+                                submitted_at_s=submitted_at_s,
+                                ready_at_s=completed_at_s,
+                            )
+                        )
+                    else:
+                        self._completed_promotion_timings.pop(
+                            job_metadata.req_context.req_id,
+                            None,
+                        )
                 else:
                     operation = "store"
                     status = "succeeded" if completed_job.success else "failed"
@@ -409,7 +445,7 @@ class TieringOffloadingManager(OffloadingManager):
                 self._record_secondary_tier_job_latency(
                     operation,
                     status,
-                    time.monotonic() - job_metadata.submitted_at_s,
+                    completed_at_s - job_metadata.submitted_at_s,
                 )
                 self._record_secondary_tier_task_runtime(
                     operation,
@@ -418,6 +454,13 @@ class TieringOffloadingManager(OffloadingManager):
                     task_wall_s=completed_job.task_wall_s,
                     task_count=completed_job.task_count,
                 )
+
+    def take_completed_promotion_timing(
+        self, req_id: str
+    ) -> CompletedPromotionTiming | None:
+        """Consume timing for a request promoted from secondary storage."""
+
+        return self._completed_promotion_timings.pop(req_id, None)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -824,6 +867,7 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.on_request_finished(req_context)
         self._request_level_tiers.pop(req_context.req_id, None)
+        self._completed_promotion_timings.pop(req_context.req_id, None)
 
     @override
     def on_schedule_end(self) -> None:
@@ -884,6 +928,7 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.reset_cache()
         self.primary_tier.reset_cache()
+        self._completed_promotion_timings.clear()
         self._processed_jobs_this_step = False
 
     @override

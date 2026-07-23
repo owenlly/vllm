@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -61,6 +63,10 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # Scheduler-observed LOAD timing. The end timestamp is recorded only after
+    # every worker reports completion, so TP loads use the critical path.
+    primary_to_gpu_submitted_at_s: float | None = None
+    external_load_started_at_s: float | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -310,11 +316,58 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self._external_load_stage_latency_stats: defaultdict[
+            str, list[float]
+        ] = defaultdict(list)
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
+
+    def _start_primary_to_gpu_timing(
+        self, req_id: str
+    ) -> tuple[float, float | None]:
+        submitted_at_s = time.monotonic()
+        external_load_started_at_s: float | None = None
+        take_promotion_timing = getattr(
+            self.manager,
+            "take_completed_promotion_timing",
+            None,
+        )
+        if callable(take_promotion_timing):
+            promotion_timing = take_promotion_timing(req_id)
+            if promotion_timing is not None:
+                external_load_started_at_s = promotion_timing.submitted_at_s
+                self._external_load_stage_latency_stats[
+                    "secondary_to_primary"
+                ].append(
+                    max(
+                        promotion_timing.ready_at_s
+                        - promotion_timing.submitted_at_s,
+                        0.0,
+                    )
+                )
+                self._external_load_stage_latency_stats["scheduler_gap"].append(
+                    max(submitted_at_s - promotion_timing.ready_at_s, 0.0)
+                )
+        return submitted_at_s, external_load_started_at_s
+
+    def _record_primary_to_gpu_completion(
+        self, job_status: TransferJobStatus
+    ) -> None:
+        completed_at_s = time.monotonic()
+        assert job_status.primary_to_gpu_submitted_at_s is not None
+        self._external_load_stage_latency_stats["primary_to_gpu"].append(
+            max(
+                completed_at_s - job_status.primary_to_gpu_submitted_at_s,
+                0.0,
+            )
+        )
+        if job_status.external_load_started_at_s is not None:
+            self._external_load_stage_latency_stats["end_to_end"].append(
+                max(completed_at_s - job_status.external_load_started_at_s, 0.0)
+            )
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
@@ -652,6 +705,11 @@ class OffloadingConnectorScheduler:
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
+        (
+            primary_to_gpu_submitted_at_s,
+            external_load_started_at_s,
+        ) = self._start_primary_to_gpu_timing(request.request_id)
+
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
@@ -665,6 +723,8 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            primary_to_gpu_submitted_at_s=primary_to_gpu_submitted_at_s,
+            external_load_started_at_s=external_load_started_at_s,
         )
 
         if self._blocks_being_loaded is not None:
@@ -974,6 +1034,7 @@ class OffloadingConnectorScheduler:
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
+                self._record_primary_to_gpu_completion(job_status)
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
@@ -1073,6 +1134,16 @@ class OffloadingConnectorScheduler:
         if hasattr(self.manager, "take_primary_eviction_stats"):
             primary_eviction_stats = self.manager.take_primary_eviction_stats()
             stats.record_primary_eviction_stats(primary_eviction_stats)
+        if self._external_load_stage_latency_stats:
+            stats.record_external_load_stage_latency_stats(
+                {
+                    stage: list(latencies)
+                    for stage, latencies in (
+                        self._external_load_stage_latency_stats.items()
+                    )
+                }
+            )
+            self._external_load_stage_latency_stats.clear()
         return None if stats.is_empty() else stats
 
     def reset_cache(self) -> None:

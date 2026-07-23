@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import defaultdict
 from collections.abc import Iterable
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -14,6 +16,7 @@ from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    TransferJobStatus,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -167,6 +170,44 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     assert isinstance(event, BlockRemoved)
     assert event.block_hashes == to_hashes([4, 5, 6])
     assert event.medium == "B"
+
+
+def test_external_load_stage_latency_tracks_request_critical_path():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = MagicMock()
+    scheduler.manager.take_completed_promotion_timing = MagicMock(
+        return_value=SimpleNamespace(
+            submitted_at_s=1.0,
+            ready_at_s=2.0,
+        )
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic",
+        side_effect=[2.25, 2.75],
+    ):
+        submitted_at_s, external_started_at_s = (
+            scheduler._start_primary_to_gpu_timing("request")
+        )
+        scheduler._record_primary_to_gpu_completion(
+            TransferJobStatus(
+                req_id="request",
+                pending_count=0,
+                keys=set(),
+                is_store=False,
+                primary_to_gpu_submitted_at_s=submitted_at_s,
+                external_load_started_at_s=external_started_at_s,
+            )
+        )
+
+    assert scheduler._external_load_stage_latency_stats == {
+        "secondary_to_primary": [1.0],
+        "scheduler_gap": [0.25],
+        "primary_to_gpu": [0.5],
+        "end_to_end": [1.75],
+    }
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

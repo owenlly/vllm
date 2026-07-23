@@ -21,6 +21,7 @@ SECONDARY_TIER_JOB_LATENCY_STATS_KEY = "secondary_tier_job_latency_stats"
 SECONDARY_TIER_TASK_RUNTIME_STATS_KEY = "secondary_tier_task_runtime_stats"
 TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
+EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
 
 
 @dataclass
@@ -59,6 +60,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                     continue
                 if k == PRIMARY_EVICTION_STATS_KEY:
                     self._aggregate_primary_eviction_stats(v)
+                    continue
+                if k == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
+                    self._aggregate_external_load_stage_latency_stats(v)
                     continue
                 if k not in self.data:
                     self.data[k] = v
@@ -134,6 +138,18 @@ class OffloadingConnectorStats(KVConnectorStats):
             for name, value in cause_stats.items():
                 output_cause_stats[name] = output_cause_stats.get(name, 0) + value
 
+    def _aggregate_external_load_stage_latency_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(
+            EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY, {}
+        )
+        assert isinstance(accumulator, dict)
+        for stage, latencies in stats.items():
+            output_latencies = accumulator.setdefault(stage, [])
+            assert isinstance(output_latencies, list)
+            output_latencies.extend(latencies)
+
     def reduce(self) -> dict[str, int | float]:
         """
         Reduce the observations collected during a time interval to one or
@@ -191,6 +207,17 @@ class OffloadingConnectorStats(KVConnectorStats):
                     assert isinstance(cause_stats, dict)
                     for name, value in cause_stats.items():
                         return_dict[f"primary_eviction_{cause}_{name}"] = value
+                continue
+            if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for stage, latencies in ops_list.items():
+                    assert isinstance(latencies, list)
+                    return_dict[
+                        f"external_load_{stage}_latency_count"
+                    ] = len(latencies)
+                    return_dict[
+                        f"external_load_{stage}_latency_sum"
+                    ] = sum(latencies)
                 continue
             assert isinstance(ops_list, list)
             total_bytes = 0
@@ -257,6 +284,13 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_primary_eviction_stats(stats)
 
+    def record_external_load_stage_latency_stats(
+        self, stats: dict[str, list[float]]
+    ) -> None:
+        if not stats:
+            return
+        self._aggregate_external_load_stage_latency_stats(stats)
+
 
 class OffloadPromMetrics(KVConnectorPromMetrics):
     def __init__(
@@ -277,6 +311,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         ] = {}
         self.histogram_secondary_tier_job_latency: dict[
             tuple[int, str, str], PromMetricT
+        ] = {}
+        self.histogram_external_load_stage_latency: dict[
+            tuple[int, str], PromMetricT
         ] = {}
         self.counter_secondary_tier_task_cpu_seconds: dict[
             tuple[int, str, str], PromMetricT
@@ -373,6 +410,15 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             documentation="Histogram of secondary tier KV offload job latency.",
             buckets=latency_buckets[:],
             labelnames=labelnames + ["operation", "status"],
+        )
+
+        self._histogram_external_load_stage_latency = self._histogram_cls(
+            name="vllm:kv_offload_external_load_stage_latency_seconds",
+            documentation=(
+                "Request-visible latency for each external KV LOAD stage."
+            ),
+            buckets=latency_buckets[:],
+            labelnames=labelnames + ["stage"],
         )
 
         self._counter_secondary_tier_task_cpu_seconds = self._counter_cls(
@@ -478,6 +524,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == PRIMARY_EVICTION_STATS_KEY:
                 self._observe_primary_eviction_stats(ops, engine_idx)
                 continue
+            if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
+                self._observe_external_load_stage_latency_stats(ops, engine_idx)
+                continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
                 self.histogram_transfer_size[(engine_idx, transfer_type)] = (
@@ -568,6 +617,24 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                     self.histogram_secondary_tier_job_latency[counter_key].observe(
                         latency_s
                     )
+
+    def _observe_external_load_stage_latency_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for stage, latencies in stats.items():
+            counter_key = (engine_idx, stage)
+            if counter_key not in self.histogram_external_load_stage_latency:
+                self.histogram_external_load_stage_latency[counter_key] = (
+                    self._histogram_external_load_stage_latency.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [stage])
+                    )
+                )
+            assert isinstance(latencies, list)
+            for latency_s in latencies:
+                self.histogram_external_load_stage_latency[counter_key].observe(
+                    latency_s
+                )
 
     def _observe_secondary_tier_task_runtime_stats(
         self, stats: dict[str, Any], engine_idx: int

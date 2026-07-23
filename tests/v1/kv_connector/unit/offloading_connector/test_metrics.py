@@ -192,6 +192,42 @@ def test_aggregate_secondary_tier_job_latency_stats():
     assert reduced["secondary_tier_promotion_failed_latency_sum"] == 0.06
 
 
+def test_aggregate_external_load_stage_latency_stats():
+    """Request-visible LOAD stage samples are preserved across workers."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_external_load_stage_latency_stats(
+        {
+            "secondary_to_primary": [0.3],
+            "scheduler_gap": [0.02],
+            "primary_to_gpu": [0.04],
+            "end_to_end": [0.36],
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_external_load_stage_latency_stats(
+        {
+            "secondary_to_primary": [0.5],
+            "scheduler_gap": [0.03],
+            "primary_to_gpu": [0.07],
+            "end_to_end": [0.6],
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["external_load_secondary_to_primary_latency_count"] == 2
+    assert reduced["external_load_secondary_to_primary_latency_sum"] == 0.8
+    assert reduced["external_load_scheduler_gap_latency_count"] == 2
+    assert reduced["external_load_scheduler_gap_latency_sum"] == 0.05
+    assert reduced["external_load_primary_to_gpu_latency_count"] == 2
+    assert (
+        abs(reduced["external_load_primary_to_gpu_latency_sum"] - 0.11)
+        < 1e-12
+    )
+    assert reduced["external_load_end_to_end_latency_count"] == 2
+    assert abs(reduced["external_load_end_to_end_latency_sum"] - 0.96) < 1e-12
+
+
 def test_aggregate_secondary_tier_task_runtime_stats():
     """Test that secondary tier task CPU/wall time counters are summed."""
     stats1 = OffloadingConnectorStats()
