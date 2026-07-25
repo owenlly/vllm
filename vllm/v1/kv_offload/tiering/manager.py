@@ -137,7 +137,7 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         enable_events: bool = False,
-        profile_block_lookup: bool = True,
+        profile_block_lookup: bool = False,
         profile_job_breakdown: bool = True,
     ):
         """
