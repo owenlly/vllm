@@ -338,6 +338,8 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        if self.connector is not None:
+            self.connector.on_scheduler_iteration_start()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -561,6 +563,8 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            if self.connector is not None:
+                self.connector.on_scheduler_waiting_phase_start()
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -773,6 +777,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if load_kv_async and self.connector is not None:
+                        self.connector.on_external_load_allocation_failure(request)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager

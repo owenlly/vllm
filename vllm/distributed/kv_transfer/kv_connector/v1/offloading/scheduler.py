@@ -195,6 +195,11 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # Job-breakdown timestamps for the scheduler revisit interval. They remain
+    # unset when profiling is disabled and do not affect scheduling decisions.
+    external_ready_observed_at_s: float | None = None
+    gpu_allocation_first_failed_at_s: float | None = None
+    gpu_allocation_completed_at_s: float | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -322,6 +327,8 @@ class OffloadingConnectorScheduler:
         self._external_load_stage_latency_stats: defaultdict[
             str, list[float]
         ] = defaultdict(list)
+        self._scheduler_iteration_started_at_s: float | None = None
+        self._scheduler_waiting_phase_started_at_s: float | None = None
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -346,6 +353,22 @@ class OffloadingConnectorScheduler:
             promotion_timing = take_promotion_timing(req_id)
             if promotion_timing is not None:
                 external_load_started_at_s = promotion_timing.submitted_at_s
+                req_status = self._req_status.get(req_id)
+                ready_observed_at_s = (
+                    req_status.external_ready_observed_at_s
+                    if req_status is not None
+                    else None
+                )
+                allocation_failed_at_s = (
+                    req_status.gpu_allocation_first_failed_at_s
+                    if req_status is not None
+                    else None
+                )
+                allocation_completed_at_s = (
+                    req_status.gpu_allocation_completed_at_s
+                    if req_status is not None
+                    else None
+                )
                 self._external_load_stage_latency_stats[
                     "secondary_to_primary"
                 ].append(
@@ -358,14 +381,109 @@ class OffloadingConnectorScheduler:
                 self._external_load_stage_latency_stats["scheduler_gap"].append(
                     max(submitted_at_s - promotion_timing.ready_at_s, 0.0)
                 )
+                revisit_wait_s = max(
+                    prepare_load_started_at_s - promotion_timing.ready_at_s, 0.0
+                )
                 self._external_load_stage_latency_stats[
                     "scheduler_revisit_wait"
-                ].append(
+                ].append(revisit_wait_s)
+                ready_detection_wait_s = (
                     max(
-                        prepare_load_started_at_s - promotion_timing.ready_at_s,
+                        min(ready_observed_at_s, prepare_load_started_at_s)
+                        - promotion_timing.ready_at_s,
                         0.0,
                     )
+                    if ready_observed_at_s is not None
+                    else 0.0
                 )
+                iteration_started_at_s = getattr(
+                    self, "_scheduler_iteration_started_at_s", None
+                )
+                waiting_phase_started_at_s = getattr(
+                    self, "_scheduler_waiting_phase_started_at_s", None
+                )
+                detection_end_at_s = (
+                    min(ready_observed_at_s, prepare_load_started_at_s)
+                    if ready_observed_at_s is not None
+                    else promotion_timing.ready_at_s
+                )
+                detection_cursor_at_s = promotion_timing.ready_at_s
+                ready_to_iteration_start_s = 0.0
+                if iteration_started_at_s is not None:
+                    iteration_boundary_at_s = min(
+                        max(iteration_started_at_s, detection_cursor_at_s),
+                        detection_end_at_s,
+                    )
+                    ready_to_iteration_start_s = max(
+                        iteration_boundary_at_s - detection_cursor_at_s, 0.0
+                    )
+                    detection_cursor_at_s = iteration_boundary_at_s
+
+                iteration_to_waiting_phase_s = 0.0
+                if waiting_phase_started_at_s is not None:
+                    waiting_boundary_at_s = min(
+                        max(waiting_phase_started_at_s, detection_cursor_at_s),
+                        detection_end_at_s,
+                    )
+                    iteration_to_waiting_phase_s = max(
+                        waiting_boundary_at_s - detection_cursor_at_s, 0.0
+                    )
+                    detection_cursor_at_s = waiting_boundary_at_s
+
+                waiting_queue_scan_s = max(
+                    detection_end_at_s - detection_cursor_at_s, 0.0
+                )
+                gpu_block_wait_s = (
+                    max(
+                        min(allocation_completed_at_s, prepare_load_started_at_s)
+                        - max(
+                            allocation_failed_at_s,
+                            (
+                                ready_observed_at_s
+                                if ready_observed_at_s is not None
+                                else promotion_timing.ready_at_s
+                            ),
+                        ),
+                        0.0,
+                    )
+                    if allocation_failed_at_s is not None
+                    and allocation_completed_at_s is not None
+                    else 0.0
+                )
+                allocation_to_prepare_wait_s = (
+                    max(
+                        prepare_load_started_at_s - allocation_completed_at_s,
+                        0.0,
+                    )
+                    if allocation_completed_at_s is not None
+                    else 0.0
+                )
+                accounted_wait_s = (
+                    ready_detection_wait_s
+                    + gpu_block_wait_s
+                    + allocation_to_prepare_wait_s
+                )
+                self._external_load_stage_latency_stats[
+                    "scheduler_ready_detection_wait"
+                ].append(ready_detection_wait_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_ready_to_iteration_start"
+                ].append(ready_to_iteration_start_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_iteration_to_waiting_phase"
+                ].append(iteration_to_waiting_phase_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_waiting_queue_scan"
+                ].append(waiting_queue_scan_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_gpu_block_wait"
+                ].append(gpu_block_wait_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_alloc_to_prepare_load"
+                ].append(allocation_to_prepare_wait_s)
+                self._external_load_stage_latency_stats[
+                    "scheduler_other_wait"
+                ].append(max(revisit_wait_s - accounted_wait_s, 0.0))
                 self._external_load_stage_latency_stats[
                     "scheduler_prepare_load"
                 ].append(
@@ -653,11 +771,38 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens = self._lookup(req_status)
+        if (
+            num_hit_tokens
+            and getattr(self, "_profile_job_breakdown", True)
+            and req_status.external_ready_observed_at_s is None
+        ):
+            req_status.external_ready_observed_at_s = time.monotonic()
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
+
+    def on_external_load_allocation_failure(self, request: Request) -> None:
+        if not getattr(self, "_profile_job_breakdown", True):
+            return
+        req_status = self._req_status.get(request.request_id)
+        if (
+            req_status is not None
+            and req_status.gpu_allocation_first_failed_at_s is None
+        ):
+            req_status.gpu_allocation_first_failed_at_s = time.monotonic()
+
+    def on_scheduler_iteration_start(self) -> None:
+        if not getattr(self, "_profile_job_breakdown", True):
+            return
+        self._scheduler_iteration_started_at_s = time.monotonic()
+        self._scheduler_waiting_phase_started_at_s = None
+
+    def on_scheduler_waiting_phase_start(self) -> None:
+        if not getattr(self, "_profile_job_breakdown", True):
+            return
+        self._scheduler_waiting_phase_started_at_s = time.monotonic()
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -666,6 +811,11 @@ class OffloadingConnectorScheduler:
             return
 
         req_status = self._req_status[request.request_id]
+        if (
+            getattr(self, "_profile_job_breakdown", True)
+            and req_status.gpu_allocation_completed_at_s is None
+        ):
+            req_status.gpu_allocation_completed_at_s = time.monotonic()
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens

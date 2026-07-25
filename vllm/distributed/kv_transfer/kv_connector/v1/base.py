@@ -506,6 +506,23 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def on_external_load_allocation_failure(self, request: "Request") -> None:
+        """Notify the connector that GPU blocks for an async load were unavailable.
+
+        Connectors may use this optional hook for observability. The default is
+        intentionally a no-op so allocation behavior is unchanged for existing
+        connectors.
+        """
+        return
+
+    def on_scheduler_iteration_start(self) -> None:
+        """Notify the connector that a scheduler iteration has started."""
+        return
+
+    def on_scheduler_waiting_phase_start(self) -> None:
+        """Notify the connector that waiting-request scheduling has started."""
+        return
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

@@ -181,6 +181,15 @@ def test_external_load_stage_latency_tracks_request_critical_path():
             ready_at_s=2.0,
         )
     )
+    scheduler._req_status = {
+        "request": SimpleNamespace(
+            external_ready_observed_at_s=2.015625,
+            gpu_allocation_first_failed_at_s=2.03125,
+            gpu_allocation_completed_at_s=2.046875,
+        )
+    }
+    scheduler._scheduler_iteration_started_at_s = 2.00390625
+    scheduler._scheduler_waiting_phase_started_at_s = 2.0078125
     scheduler._external_load_stage_latency_stats = defaultdict(list)
 
     with patch(
@@ -210,11 +219,56 @@ def test_external_load_stage_latency_tracks_request_critical_path():
         "secondary_to_primary": [1.0],
         "scheduler_gap": [0.25],
         "scheduler_revisit_wait": [0.0625],
+        "scheduler_ready_detection_wait": [0.015625],
+        "scheduler_ready_to_iteration_start": [0.00390625],
+        "scheduler_iteration_to_waiting_phase": [0.00390625],
+        "scheduler_waiting_queue_scan": [0.0078125],
+        "scheduler_gpu_block_wait": [0.015625],
+        "scheduler_alloc_to_prepare_load": [0.015625],
+        "scheduler_other_wait": [0.015625],
         "scheduler_prepare_load": [0.0625],
         "scheduler_build_load_spec": [0.125],
         "primary_to_gpu": [0.5],
         "end_to_end": [1.75],
     }
+
+
+def test_external_load_allocation_failure_records_first_failure_only():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+    req_status = SimpleNamespace(gpu_allocation_first_failed_at_s=None)
+    scheduler._req_status = {"request": req_status}
+    request = SimpleNamespace(request_id="request")
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic",
+        side_effect=[3.0, 4.0],
+    ):
+        scheduler.on_external_load_allocation_failure(request)
+        scheduler.on_external_load_allocation_failure(request)
+
+    assert req_status.gpu_allocation_first_failed_at_s == 3.0
+
+
+def test_scheduler_phase_timestamps_follow_current_iteration():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic",
+        side_effect=[1.0, 1.25, 2.0],
+    ):
+        scheduler.on_scheduler_iteration_start()
+        scheduler.on_scheduler_waiting_phase_start()
+        assert scheduler._scheduler_iteration_started_at_s == 1.0
+        assert scheduler._scheduler_waiting_phase_started_at_s == 1.25
+
+        scheduler.on_scheduler_iteration_start()
+
+    assert scheduler._scheduler_iteration_started_at_s == 2.0
+    assert scheduler._scheduler_waiting_phase_started_at_s is None
 
 
 def test_external_load_stage_latency_can_be_disabled():
