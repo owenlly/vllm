@@ -174,6 +174,8 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
 
 def test_external_load_stage_latency_tracks_request_critical_path():
     scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = True
     scheduler.manager = MagicMock()
     scheduler.manager.take_completed_promotion_timing = MagicMock(
         return_value=SimpleNamespace(
@@ -236,6 +238,7 @@ def test_external_load_stage_latency_tracks_request_critical_path():
 def test_external_load_allocation_failure_records_first_failure_only():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = True
     req_status = SimpleNamespace(gpu_allocation_first_failed_at_s=None)
     scheduler._req_status = {"request": req_status}
     request = SimpleNamespace(request_id="request")
@@ -254,6 +257,7 @@ def test_external_load_allocation_failure_records_first_failure_only():
 def test_scheduler_phase_timestamps_follow_current_iteration():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = True
 
     with patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
@@ -269,6 +273,39 @@ def test_scheduler_phase_timestamps_follow_current_iteration():
 
     assert scheduler._scheduler_iteration_started_at_s == 2.0
     assert scheduler._scheduler_waiting_phase_started_at_s is None
+
+
+def test_scheduler_revisit_breakdown_is_disabled_by_default():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = False
+    scheduler.manager = MagicMock()
+    scheduler.manager.take_completed_promotion_timing = MagicMock(
+        return_value=SimpleNamespace(
+            submitted_at_s=1.0,
+            ready_at_s=2.0,
+        )
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic",
+        return_value=2.25,
+    ):
+        scheduler._start_primary_to_gpu_timing(
+            "request",
+            prepare_load_started_at_s=2.0625,
+            prepare_load_completed_at_s=2.125,
+        )
+
+    assert scheduler._external_load_stage_latency_stats == {
+        "secondary_to_primary": [1.0],
+        "scheduler_gap": [0.25],
+        "scheduler_revisit_wait": [0.0625],
+        "scheduler_prepare_load": [0.0625],
+        "scheduler_build_load_spec": [0.125],
+    }
 
 
 def test_external_load_stage_latency_can_be_disabled():
