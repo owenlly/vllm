@@ -98,6 +98,55 @@ def test_aggregate_same_connector():
     ]
 
 
+def test_aggregate_rdma_transport_stats():
+    """Actual verbs counters are summed by operation across TP workers."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_rdma_transport_stats(
+        "write",
+        {
+            "logical_requests": 10,
+            "wr_posted": 4,
+            "sge_posted": 20,
+            "multi_sge_wr": 4,
+            "wr_split": 0,
+        },
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_rdma_transport_stats(
+        "write",
+        {
+            "logical_requests": 6,
+            "wr_posted": 3,
+            "sge_posted": 12,
+            "multi_sge_wr": 3,
+            "wr_split": 1,
+        },
+    )
+    stats2.record_rdma_transport_stats(
+        "read",
+        {
+            "logical_requests": 2,
+            "wr_posted": 2,
+            "sge_posted": 8,
+            "multi_sge_wr": 2,
+            "wr_split": 0,
+        },
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["rdma_write_logical_requests"] == 16
+    assert reduced["rdma_write_wr_posted"] == 7
+    assert reduced["rdma_write_sge_posted"] == 32
+    assert reduced["rdma_write_multi_sge_wr"] == 7
+    assert reduced["rdma_write_wr_split"] == 1
+    assert reduced["rdma_read_logical_requests"] == 2
+    assert reduced["rdma_read_wr_posted"] == 2
+    assert reduced["rdma_read_sge_posted"] == 8
+    assert reduced["rdma_read_multi_sge_wr"] == 2
+    assert reduced["rdma_read_wr_split"] == 0
+
+
 def test_aggregate_secondary_tier_stats():
     """Test that secondary tier counters are summed across observations."""
     stats1 = OffloadingConnectorStats()

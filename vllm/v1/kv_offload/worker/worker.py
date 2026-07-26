@@ -21,6 +21,7 @@ class TransferResult:
     transfer_size: int | None = None  # Size in bytes
     transfer_time: float | None = None
     transfer_type: TransferType | None = None
+    rdma_stats: dict[str, int] | None = None
 
 
 class OffloadingHandler(ABC):

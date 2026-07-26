@@ -281,6 +281,19 @@ class OffloadingConnectorWorker:
                     time=transfer_result.transfer_time,
                     transfer_type=transfer_result.transfer_type,
                 )
+            if (
+                transfer_result.rdma_stats is not None
+                and transfer_result.transfer_type is not None
+            ):
+                operation = {
+                    ("DPU", "GPU"): "read",
+                    ("GPU", "DPU"): "write",
+                }.get(transfer_result.transfer_type)
+                if operation is not None:
+                    self.kv_connector_stats.record_rdma_transport_stats(
+                        operation,
+                        transfer_result.rdma_stats,
+                    )
 
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)

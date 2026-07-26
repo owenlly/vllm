@@ -22,6 +22,14 @@ SECONDARY_TIER_TASK_RUNTIME_STATS_KEY = "secondary_tier_task_runtime_stats"
 TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
+RDMA_TRANSPORT_STATS_KEY = "rdma_transport_stats"
+RDMA_TRANSPORT_STAT_NAMES = (
+    "logical_requests",
+    "wr_posted",
+    "sge_posted",
+    "multi_sge_wr",
+    "wr_split",
+)
 
 
 @dataclass
@@ -63,6 +71,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                     continue
                 if k == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_external_load_stage_latency_stats(v)
+                    continue
+                if k == RDMA_TRANSPORT_STATS_KEY:
+                    self._aggregate_rdma_transport_stats(v)
                     continue
                 if k not in self.data:
                     self.data[k] = v
@@ -150,6 +161,20 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
 
+    def _aggregate_rdma_transport_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(RDMA_TRANSPORT_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            output_operation_stats = accumulator.setdefault(operation, {})
+            assert isinstance(output_operation_stats, dict)
+            for name, value in operation_stats.items():
+                output_operation_stats[name] = (
+                    output_operation_stats.get(name, 0) + value
+                )
+
     def reduce(self) -> dict[str, int | float]:
         """
         Reduce the observations collected during a time interval to one or
@@ -218,6 +243,13 @@ class OffloadingConnectorStats(KVConnectorStats):
                     return_dict[
                         f"external_load_{stage}_latency_sum"
                     ] = sum(latencies)
+                continue
+            if transfer_type == RDMA_TRANSPORT_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for operation, operation_stats in ops_list.items():
+                    assert isinstance(operation_stats, dict)
+                    for name, value in operation_stats.items():
+                        return_dict[f"rdma_{operation}_{name}"] = value
                 continue
             assert isinstance(ops_list, list)
             total_bytes = 0
@@ -291,6 +323,22 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_external_load_stage_latency_stats(stats)
 
+    def record_rdma_transport_stats(
+        self,
+        operation: str,
+        stats: dict[str, int],
+    ) -> None:
+        if operation not in {"read", "write"}:
+            raise ValueError("RDMA operation must be 'read' or 'write'")
+        unknown_names = set(stats).difference(RDMA_TRANSPORT_STAT_NAMES)
+        if unknown_names:
+            raise ValueError(
+                f"unknown RDMA transport counters: {sorted(unknown_names)}"
+            )
+        if any(value < 0 for value in stats.values()):
+            raise ValueError("RDMA transport counters must be non-negative")
+        self._aggregate_rdma_transport_stats({operation: stats})
+
 
 class OffloadPromMetrics(KVConnectorPromMetrics):
     def __init__(
@@ -339,6 +387,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         ] = {}
         self.counter_primary_eviction_blocks: dict[
             tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_rdma_transport_stats: dict[
+            tuple[int, str, str], PromMetricT
         ] = {}
         gauge_cpu_cache_usage = self._gauge_cls(
             name="vllm:kv_offload_cpu_cache_usage_perc",
@@ -489,6 +540,32 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames + ["cause"],
         )
 
+        rdma_counter_docs = {
+            "logical_requests": (
+                "Number of rank-local logical RDMA transfer ranges."
+            ),
+            "wr_posted": "Number of RDMA work requests posted to send queues.",
+            "sge_posted": (
+                "Number of scatter-gather entries carried by posted RDMA "
+                "work requests."
+            ),
+            "multi_sge_wr": (
+                "Number of posted RDMA work requests containing multiple SGEs."
+            ),
+            "wr_split": (
+                "Number of extra RDMA work requests caused by splitting a "
+                "logical transfer range."
+            ),
+        }
+        self._counter_rdma_transport_stats = {
+            name: self._counter_cls(
+                name=f"vllm:kv_offload_rdma_{name}",
+                documentation=documentation,
+                labelnames=labelnames + ["operation"],
+            )
+            for name, documentation in rdma_counter_docs.items()
+        }
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -527,6 +604,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_external_load_stage_latency_stats(ops, engine_idx)
                 continue
+            if transfer_type == RDMA_TRANSPORT_STATS_KEY:
+                self._observe_rdma_transport_stats(ops, engine_idx)
+                continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
                 self.histogram_transfer_size[(engine_idx, transfer_type)] = (
@@ -560,6 +640,26 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.counter_kv_transfer_time[(engine_idx, transfer_type)].inc(
                     op["op_time"]
                 )
+
+    def _observe_rdma_transport_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for operation, operation_stats in stats.items():
+            assert isinstance(operation_stats, dict)
+            for name, value in operation_stats.items():
+                counter_key = (engine_idx, operation, name)
+                if counter_key not in self.counter_rdma_transport_stats:
+                    self.counter_rdma_transport_stats[counter_key] = (
+                        self._counter_rdma_transport_stats[name].labels(
+                            *(
+                                self.per_engine_labelvalues[engine_idx]
+                                + [operation]
+                            )
+                        )
+                    )
+                if value:
+                    self.counter_rdma_transport_stats[counter_key].inc(value)
 
     def _observe_secondary_tier_stats(
         self, stats: dict[str, Any], engine_idx: int
