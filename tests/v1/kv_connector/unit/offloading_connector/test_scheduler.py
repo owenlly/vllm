@@ -351,6 +351,33 @@ def test_external_load_host_latency_stats_are_exported():
     }
 
 
+def test_fused_store_stage_latency_stats_are_exported():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace(
+        take_fused_store_stage_latency_stats=lambda: {
+            "ingest_latency": [0.1],
+            "gpu_pin_duration": [0.11],
+            "persist_latency": [0.3],
+            "publish_latency": [0.02],
+        }
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "fused_store_ingest_latency_count": 1,
+        "fused_store_ingest_latency_sum": 0.1,
+        "fused_store_gpu_pin_duration_count": 1,
+        "fused_store_gpu_pin_duration_sum": 0.11,
+        "fused_store_persist_latency_count": 1,
+        "fused_store_persist_latency_sum": 0.3,
+        "fused_store_publish_latency_count": 1,
+        "fused_store_publish_latency_sum": 0.02,
+    }
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_request_preemption(request_runner, async_scheduling: bool):
     block_size = 4

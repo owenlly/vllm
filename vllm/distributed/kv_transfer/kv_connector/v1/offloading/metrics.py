@@ -22,6 +22,7 @@ SECONDARY_TIER_TASK_RUNTIME_STATS_KEY = "secondary_tier_task_runtime_stats"
 TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
+FUSED_STORE_STAGE_LATENCY_STATS_KEY = "fused_store_stage_latency_stats"
 RDMA_TRANSPORT_STATS_KEY = "rdma_transport_stats"
 RDMA_TRANSPORT_STAT_NAMES = (
     "logical_requests",
@@ -71,6 +72,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                     continue
                 if k == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_external_load_stage_latency_stats(v)
+                    continue
+                if k == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
+                    self._aggregate_fused_store_stage_latency_stats(v)
                     continue
                 if k == RDMA_TRANSPORT_STATS_KEY:
                     self._aggregate_rdma_transport_stats(v)
@@ -161,6 +165,18 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
 
+    def _aggregate_fused_store_stage_latency_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(
+            FUSED_STORE_STAGE_LATENCY_STATS_KEY, {}
+        )
+        assert isinstance(accumulator, dict)
+        for stage, latencies in stats.items():
+            output_latencies = accumulator.setdefault(stage, [])
+            assert isinstance(output_latencies, list)
+            output_latencies.extend(latencies)
+
     def _aggregate_rdma_transport_stats(
         self, stats: dict[str, Any]
     ) -> None:
@@ -244,6 +260,13 @@ class OffloadingConnectorStats(KVConnectorStats):
                         f"external_load_{stage}_latency_sum"
                     ] = sum(latencies)
                 continue
+            if transfer_type == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for stage, latencies in ops_list.items():
+                    assert isinstance(latencies, list)
+                    return_dict[f"fused_store_{stage}_count"] = len(latencies)
+                    return_dict[f"fused_store_{stage}_sum"] = sum(latencies)
+                continue
             if transfer_type == RDMA_TRANSPORT_STATS_KEY:
                 assert isinstance(ops_list, dict)
                 for operation, operation_stats in ops_list.items():
@@ -323,6 +346,13 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_external_load_stage_latency_stats(stats)
 
+    def record_fused_store_stage_latency_stats(
+        self, stats: dict[str, list[float]]
+    ) -> None:
+        if not stats:
+            return
+        self._aggregate_fused_store_stage_latency_stats(stats)
+
     def record_rdma_transport_stats(
         self,
         operation: str,
@@ -361,6 +391,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             tuple[int, str, str], PromMetricT
         ] = {}
         self.histogram_external_load_stage_latency: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.histogram_fused_store_stage_latency: dict[
             tuple[int, str], PromMetricT
         ] = {}
         self.counter_secondary_tier_task_cpu_seconds: dict[
@@ -468,6 +501,13 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             documentation=(
                 "Request-visible latency for each external KV LOAD stage."
             ),
+            buckets=latency_buckets[:],
+            labelnames=labelnames + ["stage"],
+        )
+
+        self._histogram_fused_store_stage_latency = self._histogram_cls(
+            name="vllm:kv_offload_fused_store_stage_latency_seconds",
+            documentation="Host-observed latency for each fused STORE stage.",
             buckets=latency_buckets[:],
             labelnames=labelnames + ["stage"],
         )
@@ -604,6 +644,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_external_load_stage_latency_stats(ops, engine_idx)
                 continue
+            if transfer_type == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
+                self._observe_fused_store_stage_latency_stats(ops, engine_idx)
+                continue
             if transfer_type == RDMA_TRANSPORT_STATS_KEY:
                 self._observe_rdma_transport_stats(ops, engine_idx)
                 continue
@@ -733,6 +776,24 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             assert isinstance(latencies, list)
             for latency_s in latencies:
                 self.histogram_external_load_stage_latency[counter_key].observe(
+                    latency_s
+                )
+
+    def _observe_fused_store_stage_latency_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for stage, latencies in stats.items():
+            counter_key = (engine_idx, stage)
+            if counter_key not in self.histogram_fused_store_stage_latency:
+                self.histogram_fused_store_stage_latency[counter_key] = (
+                    self._histogram_fused_store_stage_latency.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [stage])
+                    )
+                )
+            assert isinstance(latencies, list)
+            for latency_s in latencies:
+                self.histogram_fused_store_stage_latency[counter_key].observe(
                     latency_s
                 )
 

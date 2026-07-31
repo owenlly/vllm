@@ -277,6 +277,41 @@ def test_aggregate_external_load_stage_latency_stats():
     assert abs(reduced["external_load_end_to_end_latency_sum"] - 0.96) < 1e-12
 
 
+def test_aggregate_fused_store_stage_latency_stats():
+    """Fused STORE stage samples are preserved across observations."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_fused_store_stage_latency_stats(
+        {
+            "ingest_latency": [0.1],
+            "gpu_pin_duration": [0.11],
+            "persist_latency": [0.3],
+            "publish_latency": [0.02],
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_fused_store_stage_latency_stats(
+        {
+            "ingest_latency": [0.2],
+            "gpu_pin_duration": [0.21],
+            "persist_latency": [0.4],
+            "publish_latency": [0.03],
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["fused_store_ingest_latency_count"] == 2
+    assert abs(reduced["fused_store_ingest_latency_sum"] - 0.3) < 1e-12
+    assert reduced["fused_store_gpu_pin_duration_count"] == 2
+    assert (
+        abs(reduced["fused_store_gpu_pin_duration_sum"] - 0.32) < 1e-12
+    )
+    assert reduced["fused_store_persist_latency_count"] == 2
+    assert abs(reduced["fused_store_persist_latency_sum"] - 0.7) < 1e-12
+    assert reduced["fused_store_publish_latency_count"] == 2
+    assert abs(reduced["fused_store_publish_latency_sum"] - 0.05) < 1e-12
+
+
 def test_aggregate_secondary_tier_task_runtime_stats():
     """Test that secondary tier task CPU/wall time counters are summed."""
     stats1 = OffloadingConnectorStats()

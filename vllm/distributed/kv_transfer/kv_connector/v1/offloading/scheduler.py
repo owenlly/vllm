@@ -1345,6 +1345,13 @@ class OffloadingConnectorScheduler:
                 self.manager.take_external_load_stage_latency_stats()
             )
             stats.record_external_load_stage_latency_stats(host_latency_stats)
+        if hasattr(self.manager, "take_fused_store_stage_latency_stats"):
+            fused_store_latency_stats = (
+                self.manager.take_fused_store_stage_latency_stats()
+            )
+            stats.record_fused_store_stage_latency_stats(
+                fused_store_latency_stats
+            )
         if self._external_load_stage_latency_stats:
             stats.record_external_load_stage_latency_stats(
                 {
