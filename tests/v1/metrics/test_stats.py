@@ -202,6 +202,49 @@ def test_prompt_token_stats_mixed_sources():
     assert stats.total == 1000
 
 
+def test_prompt_cache_attribution_uses_first_local_lookup():
+    """Scheduler retries must not reclassify external hits as initial HBM."""
+    stats = PromptTokenStats()
+    prefill_stats = PrefillStats()
+
+    prefill_stats.observe_initial_local_cache_hit(400)
+    # A retry sees a larger HBM prefix, but the first observation is stable.
+    prefill_stats.observe_initial_local_cache_hit(700)
+    prefill_stats.set(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=700,
+        num_external_cached_tokens=100,
+        num_external_lookup_cached_tokens=800,
+    )
+    stats.update_from_output(prefill_stats)
+
+    assert stats.attribution_prompt_tokens == 1000
+    assert stats.initial_hbm_hit == 400
+    assert stats.external_lookup_hit == 800
+    assert stats.hbm_external_overlap == 400
+    assert stats.external_unique_hit == 400
+    assert stats.corrected_total_hit == 800
+    assert stats.corrected_compute == 200
+    assert stats.external_load == 100
+
+
+def test_prompt_cache_attribution_requires_independent_external_lookup():
+    """Do not guess external overlap from incremental load tokens."""
+    stats = PromptTokenStats()
+    prefill_stats = PrefillStats()
+    prefill_stats.observe_initial_local_cache_hit(400)
+    prefill_stats.set(
+        num_prompt_tokens=1000,
+        num_local_cached_tokens=700,
+        num_external_cached_tokens=100,
+    )
+
+    stats.update_from_output(prefill_stats)
+
+    assert stats.attribution_prompt_tokens == 0
+    assert stats.corrected_total_hit == 0
+
+
 def test_prompt_token_stats_full_local_cache_recompute():
     """Test full local cache triggers last token recomputation.
 

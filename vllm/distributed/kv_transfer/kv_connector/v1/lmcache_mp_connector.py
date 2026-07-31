@@ -800,6 +800,13 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         )
         return need_to_load, need_to_load > 0
 
+    def get_external_prefix_cache_hit_tokens(
+        self, request: "Request"
+    ) -> int | None:
+        """Return LMCache's full hit, including overlap with vLLM APC."""
+        tracker = self._get_request_tracker(request.request_id)
+        return tracker.num_lmcache_hit_blocks * self.vllm_block_size
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -1209,11 +1216,22 @@ def _resolve_lmcache_mp_connector() -> type[KVConnectorBase_V1]:
             LMCacheMPConnector as _ExternalLMCacheMPConnector,
         )
 
+        class LMCacheMPConnectorWithAttribution(_ExternalLMCacheMPConnector):
+            """External LMCache connector with exact prefix attribution."""
+
+            def get_external_prefix_cache_hit_tokens(
+                self, request: "Request"
+            ) -> int | None:
+                tracker = self._get_request_tracker(request.request_id)
+                return (
+                    tracker.num_lmcache_hit_blocks * self.vllm_block_size
+                )
+
         logger.info(
             "Using external LMCacheMPConnector from "
             "lmcache.integration.vllm.lmcache_mp_connector"
         )
-        return _ExternalLMCacheMPConnector
+        return LMCacheMPConnectorWithAttribution
     except ImportError as e:
         logger.info(
             "External LMCacheMPConnector is not available (%s), "

@@ -485,6 +485,25 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_external_prefix_cache_hit_tokens(
+        self, request: "Request"
+    ) -> int | None:
+        """Return the connector's full prefix hit for source attribution.
+
+        Unlike :meth:`get_num_new_matched_tokens`, this value includes the
+        prefix that overlaps with locally cached GPU KV. Connectors that can
+        report only the additional tokens to load should leave this method
+        unimplemented so attribution metrics are not inferred incorrectly.
+
+        Args:
+            request: Request whose completed external lookup is being queried.
+
+        Returns:
+            Number of prompt-prefix tokens present in the external cache, or
+            ``None`` when the connector cannot report an independent hit.
+        """
+        return None
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

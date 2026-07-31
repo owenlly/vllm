@@ -606,6 +606,9 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 num_external_computed_tokens = 0
+                num_external_lookup_cached_tokens: int | None = (
+                    0 if self.connector is None else None
+                )
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
@@ -615,6 +618,10 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if request.prefill_stats is not None:
+                        request.prefill_stats.observe_initial_local_cache_hit(
+                            num_new_local_computed_tokens
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -633,6 +640,11 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        num_external_lookup_cached_tokens = (
+                            self.connector.get_external_prefix_cache_hit_tokens(
+                                request
+                            )
+                        )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -664,6 +676,9 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
+                            num_external_lookup_cached_tokens=(
+                                num_external_lookup_cached_tokens
+                            ),
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

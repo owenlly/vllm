@@ -649,6 +649,25 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for idx in engine_indexes
             }
 
+        counter_prompt_cache_attribution_tokens = self._counter_cls(
+            name="vllm:prompt_cache_attribution_tokens",
+            documentation=(
+                "Prompt cache attribution captured at the first local lookup "
+                "and an independent external-cache lookup."
+            ),
+            labelnames=labelnames + ["source"],
+        )
+        self.counter_prompt_cache_attribution_tokens: dict[
+            str, dict[int, Counter]
+        ] = {}
+        for source in PromptTokenStats.CACHE_ATTRIBUTION_SOURCES:
+            self.counter_prompt_cache_attribution_tokens[source] = {
+                idx: counter_prompt_cache_attribution_tokens.labels(
+                    model_name, str(idx), source
+                )
+                for idx in engine_indexes
+            }
+
         # Cached prompt tokens counter
         counter_prompt_tokens_cached = self._counter_cls(
             name="vllm:prompt_tokens_cached",
@@ -1155,6 +1174,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         for source in PromptTokenStats.ALL_SOURCES:
             self.counter_prompt_tokens_by_source[source][engine_idx].inc(
                 pts.get_by_source(source)
+            )
+        for source in PromptTokenStats.CACHE_ATTRIBUTION_SOURCES:
+            self.counter_prompt_cache_attribution_tokens[source][engine_idx].inc(
+                pts.get_cache_attribution_by_source(source)
             )
         self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
         self.counter_generation_tokens[engine_idx].inc(

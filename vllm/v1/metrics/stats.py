@@ -249,6 +249,10 @@ class PrefillStats:
         num_cached_tokens: Tokens to be prefilled without actual compute work.
         num_local_cached_tokens: Tokens to be prefilled from local prefix cache.
         num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
+        initial_local_cached_tokens: Local prefix hit observed before the first
+            external lookup attempt. This remains stable across scheduler retries.
+        external_lookup_cached_tokens: Full prefix reported by the external
+            cache, including tokens that overlap the initial local prefix.
     """
 
     num_prompt_tokens: int = 0
@@ -256,12 +260,27 @@ class PrefillStats:
     num_cached_tokens: int = 0
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
+    initial_local_cached_tokens: int | None = None
+    external_lookup_cached_tokens: int = 0
+    local_external_overlap_tokens: int = 0
+    external_unique_cached_tokens: int = 0
+    corrected_cached_tokens: int = 0
+    corrected_computed_tokens: int = 0
+    external_load_tokens: int = 0
+    cache_attribution_available: bool = False
+
+    def observe_initial_local_cache_hit(self, num_tokens: int) -> None:
+        """Capture the first local-cache lookup without overwriting retries."""
+        assert num_tokens >= 0
+        if self.initial_local_cached_tokens is None:
+            self.initial_local_cached_tokens = num_tokens
 
     def set(
         self,
         num_prompt_tokens: int,
         num_local_cached_tokens: int,
         num_external_cached_tokens: int,
+        num_external_lookup_cached_tokens: int | None = None,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
         assert num_cached_tokens <= num_prompt_tokens
@@ -271,6 +290,36 @@ class PrefillStats:
         self.num_cached_tokens = num_cached_tokens
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
+        self.external_load_tokens = num_external_cached_tokens
+
+        if num_external_lookup_cached_tokens is None:
+            return
+
+        initial_local_cached_tokens = self.initial_local_cached_tokens
+        if initial_local_cached_tokens is None:
+            initial_local_cached_tokens = num_local_cached_tokens
+            self.initial_local_cached_tokens = initial_local_cached_tokens
+
+        assert initial_local_cached_tokens <= num_prompt_tokens
+        assert num_external_lookup_cached_tokens <= num_prompt_tokens
+        overlap_tokens = min(
+            initial_local_cached_tokens, num_external_lookup_cached_tokens
+        )
+        external_unique_tokens = max(
+            num_external_lookup_cached_tokens - initial_local_cached_tokens, 0
+        )
+        corrected_cached_tokens = (
+            initial_local_cached_tokens + external_unique_tokens
+        )
+
+        self.external_lookup_cached_tokens = num_external_lookup_cached_tokens
+        self.local_external_overlap_tokens = overlap_tokens
+        self.external_unique_cached_tokens = external_unique_tokens
+        self.corrected_cached_tokens = corrected_cached_tokens
+        self.corrected_computed_tokens = (
+            num_prompt_tokens - corrected_cached_tokens
+        )
+        self.cache_attribution_available = True
 
 
 @dataclass
@@ -294,12 +343,30 @@ class PromptTokenStats:
         "local_cache_hit",
         "external_kv_transfer",
     )
+    CACHE_ATTRIBUTION_SOURCES: tuple[str, ...] = (
+        "prompt",
+        "initial_hbm_hit",
+        "external_lookup_hit",
+        "hbm_external_overlap",
+        "external_unique_hit",
+        "corrected_total_hit",
+        "corrected_compute",
+        "external_load",
+    )
 
     computed: int = 0
     local_cache_hit: int = 0
     external_kv_transfer: int = 0
     cached_tokens: int = 0
     total: int = 0
+    attribution_prompt_tokens: int = 0
+    initial_hbm_hit: int = 0
+    external_lookup_hit: int = 0
+    hbm_external_overlap: int = 0
+    external_unique_hit: int = 0
+    corrected_total_hit: int = 0
+    corrected_compute: int = 0
+    external_load: int = 0
 
     def update_from_output(self, prefill_stats: PrefillStats) -> None:
         """Update stats from a prefill output."""
@@ -310,6 +377,26 @@ class PromptTokenStats:
         self.local_cache_hit += prefill_stats.num_local_cached_tokens
         self.external_kv_transfer += prefill_stats.num_external_cached_tokens
 
+        if prefill_stats.cache_attribution_available:
+            initial_local_cached_tokens = (
+                prefill_stats.initial_local_cached_tokens
+            )
+            assert initial_local_cached_tokens is not None
+            self.attribution_prompt_tokens += prefill_stats.num_prompt_tokens
+            self.initial_hbm_hit += initial_local_cached_tokens
+            self.external_lookup_hit += (
+                prefill_stats.external_lookup_cached_tokens
+            )
+            self.hbm_external_overlap += (
+                prefill_stats.local_external_overlap_tokens
+            )
+            self.external_unique_hit += (
+                prefill_stats.external_unique_cached_tokens
+            )
+            self.corrected_total_hit += prefill_stats.corrected_cached_tokens
+            self.corrected_compute += prefill_stats.corrected_computed_tokens
+            self.external_load += prefill_stats.external_load_tokens
+
     def get_by_source(self, source: str) -> int:
         """Get token count by source label."""
         source_map = {
@@ -319,6 +406,22 @@ class PromptTokenStats:
         }
         if source not in source_map:
             raise ValueError(f"Unknown source: {source}")
+        return source_map[source]
+
+    def get_cache_attribution_by_source(self, source: str) -> int:
+        """Return corrected cache-attribution tokens by source label."""
+        source_map = {
+            "prompt": self.attribution_prompt_tokens,
+            "initial_hbm_hit": self.initial_hbm_hit,
+            "external_lookup_hit": self.external_lookup_hit,
+            "hbm_external_overlap": self.hbm_external_overlap,
+            "external_unique_hit": self.external_unique_hit,
+            "corrected_total_hit": self.corrected_total_hit,
+            "corrected_compute": self.corrected_compute,
+            "external_load": self.external_load,
+        }
+        if source not in source_map:
+            raise ValueError(f"Unknown cache attribution source: {source}")
         return source_map[source]
 
 
