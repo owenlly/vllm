@@ -293,14 +293,23 @@ class OffloadingConnectorWorker:
                 and transfer_result.transfer_type is not None
             ):
                 operation = {
-                    ("DPU", "GPU"): "read",
-                    ("GPU", "DPU"): "write",
+                    ("DPU", "GPU"): "load",
+                    ("GPU", "DPU"): "store",
                 }.get(transfer_result.transfer_type)
                 if operation is not None:
                     self.kv_connector_stats.record_rdma_transport_stats(
                         operation,
                         transfer_result.rdma_stats,
                     )
+            if transfer_result.fused_load_stage_latencies:
+                self.kv_connector_stats.record_fused_load_stage_latency_stats(
+                    {
+                        stage: [latency_s]
+                        for stage, latency_s in (
+                            transfer_result.fused_load_stage_latencies.items()
+                        )
+                    }
+                )
 
             self._connector_worker_meta.mark_completed(job_id)
             if not transfer_result.success:

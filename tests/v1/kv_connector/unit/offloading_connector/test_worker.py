@@ -170,6 +170,69 @@ def test_failed_store_reports_failure_without_invalid_gpu_load_blocks():
     assert worker.get_block_ids_with_load_errors() == set()
 
 
+@pytest.mark.parametrize(
+    ("transfer_type", "expected_operation"),
+    [
+        (("GPU", "DPU"), "store"),
+        (("DPU", "GPU"), "load"),
+    ],
+)
+def test_rdma_stats_use_logical_store_load_operations(
+    transfer_type: tuple[str, str],
+    expected_operation: str,
+):
+    from vllm.v1.kv_offload.worker.worker import TransferResult
+
+    worker = _make_completion_only_worker()
+    rdma_stats = {"logical_requests": 2}
+    worker.worker.get_finished.return_value = [
+        TransferResult(
+            job_id=31,
+            success=True,
+            transfer_type=transfer_type,
+            rdma_stats=rdma_stats,
+        )
+    ]
+
+    worker.get_finished(set())
+
+    worker.kv_connector_stats.record_rdma_transport_stats.assert_called_once_with(
+        expected_operation,
+        rdma_stats,
+    )
+
+
+def test_fused_load_stage_timings_are_recorded():
+    from vllm.v1.kv_offload.worker.worker import TransferResult
+
+    worker = _make_completion_only_worker()
+    stage_latencies = {
+        "secondary_to_primary": 0.1,
+        "primary_to_gpu": 0.2,
+        "worker_total": 0.35,
+    }
+    worker.worker.get_finished.return_value = [
+        TransferResult(
+            job_id=32,
+            success=True,
+            fused_load_stage_latencies=stage_latencies,
+        )
+    ]
+
+    worker.get_finished(set())
+
+    record = (
+        worker.kv_connector_stats.record_fused_load_stage_latency_stats
+    )
+    record.assert_called_once_with(
+        {
+            "secondary_to_primary": [0.1],
+            "primary_to_gpu": [0.2],
+            "worker_total": [0.35],
+        }
+    )
+
+
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)
 def test_register_kv_caches(backend):
     """Test register_kv_caches with multiple groups covering all layer types.

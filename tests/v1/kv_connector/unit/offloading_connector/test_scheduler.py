@@ -180,7 +180,7 @@ def test_external_load_stage_latency_tracks_request_critical_path():
     scheduler.manager.take_completed_promotion_timing = MagicMock(
         return_value=SimpleNamespace(
             submitted_at_s=1.0,
-            ready_at_s=2.0,
+            primary_published_at_s=2.0,
         )
     )
     scheduler._req_status = {
@@ -199,26 +199,26 @@ def test_external_load_stage_latency_tracks_request_critical_path():
         "scheduler.time.monotonic",
         side_effect=[2.25, 2.75],
     ):
-        submitted_at_s, external_started_at_s = (
-            scheduler._start_primary_to_gpu_timing(
+        job_created_at_s, external_started_at_s = (
+            scheduler._start_load_job_created_to_gpu_ready_timing(
                 "request",
                 prepare_load_started_at_s=2.0625,
                 prepare_load_completed_at_s=2.125,
             )
         )
-        scheduler._record_primary_to_gpu_completion(
+        scheduler._record_load_gpu_ready(
             TransferJobStatus(
                 req_id="request",
                 pending_count=0,
                 keys=set(),
                 is_store=False,
-                primary_to_gpu_submitted_at_s=submitted_at_s,
+                load_job_created_at_s=job_created_at_s,
                 external_load_started_at_s=external_started_at_s,
             )
         )
 
     assert scheduler._external_load_stage_latency_stats == {
-        "secondary_to_primary": [1.0],
+        "secondary_submit_to_primary_published": [1.0],
         "scheduler_gap": [0.25],
         "scheduler_revisit_wait": [0.0625],
         "scheduler_ready_detection_wait": [0.015625],
@@ -230,8 +230,8 @@ def test_external_load_stage_latency_tracks_request_critical_path():
         "scheduler_other_wait": [0.015625],
         "scheduler_prepare_load": [0.0625],
         "scheduler_build_load_spec": [0.125],
-        "primary_to_gpu": [0.5],
-        "end_to_end": [1.75],
+        "scheduler_job_created_to_gpu_ready": [0.5],
+        "secondary_submit_to_gpu_ready": [1.75],
     }
 
 
@@ -283,7 +283,7 @@ def test_scheduler_revisit_breakdown_is_disabled_by_default():
     scheduler.manager.take_completed_promotion_timing = MagicMock(
         return_value=SimpleNamespace(
             submitted_at_s=1.0,
-            ready_at_s=2.0,
+            primary_published_at_s=2.0,
         )
     )
     scheduler._external_load_stage_latency_stats = defaultdict(list)
@@ -293,14 +293,14 @@ def test_scheduler_revisit_breakdown_is_disabled_by_default():
         "scheduler.time.monotonic",
         return_value=2.25,
     ):
-        scheduler._start_primary_to_gpu_timing(
+        scheduler._start_load_job_created_to_gpu_ready_timing(
             "request",
             prepare_load_started_at_s=2.0625,
             prepare_load_completed_at_s=2.125,
         )
 
     assert scheduler._external_load_stage_latency_stats == {
-        "secondary_to_primary": [1.0],
+        "secondary_submit_to_primary_published": [1.0],
         "scheduler_gap": [0.25],
         "scheduler_revisit_wait": [0.0625],
         "scheduler_prepare_load": [0.0625],
@@ -317,7 +317,7 @@ def test_external_load_stage_latency_can_be_disabled():
         "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
         "scheduler.time.monotonic"
     ) as monotonic:
-        scheduler._record_primary_to_gpu_completion(
+        scheduler._record_load_gpu_ready(
             TransferJobStatus(
                 req_id="request",
                 pending_count=0,
@@ -355,10 +355,10 @@ def test_fused_store_stage_latency_stats_are_exported():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = SimpleNamespace(
         take_fused_store_stage_latency_stats=lambda: {
-            "ingest_latency": [0.1],
-            "gpu_pin_duration": [0.11],
-            "persist_latency": [0.3],
-            "publish_latency": [0.02],
+            "prepared_to_primary_ready": [0.1],
+            "prepared_to_gpu_source_release_ready": [0.11],
+            "primary_ready_to_primary_to_secondary_done": [0.3],
+            "primary_to_secondary_done_to_secondary_ready": [0.02],
         }
     )
     scheduler._external_load_stage_latency_stats = defaultdict(list)
@@ -367,29 +367,29 @@ def test_fused_store_stage_latency_stats_are_exported():
 
     assert stats is not None
     assert stats.reduce() == {
-        "fused_store_ingest_latency_count": 1,
-        "fused_store_ingest_latency_sum": 0.1,
-        "fused_store_gpu_pin_duration_count": 1,
-        "fused_store_gpu_pin_duration_sum": 0.11,
-        "fused_store_persist_latency_count": 1,
-        "fused_store_persist_latency_sum": 0.3,
-        "fused_store_publish_latency_count": 1,
-        "fused_store_publish_latency_sum": 0.02,
+        "fused_store_prepared_to_primary_ready_latency_count": 1,
+        "fused_store_prepared_to_primary_ready_latency_sum": 0.1,
+        "fused_store_prepared_to_gpu_source_release_ready_latency_count": 1,
+        "fused_store_prepared_to_gpu_source_release_ready_latency_sum": 0.11,
+        "fused_store_primary_ready_to_primary_to_secondary_done_latency_count": 1,
+        "fused_store_primary_ready_to_primary_to_secondary_done_latency_sum": 0.3,
+        "fused_store_primary_to_secondary_done_to_secondary_ready_latency_count": 1,
+        "fused_store_primary_to_secondary_done_to_secondary_ready_latency_sum": 0.02,
     }
 
 
-def test_post_ingest_reuse_stats_are_exported():
+def test_post_store_primary_ready_reuse_stats_are_exported():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = SimpleNamespace(
-        take_post_ingest_reuse_stats=lambda: {
+        take_post_store_primary_ready_reuse_stats=lambda: {
             "counters": {
-                "ingested_keys": 5,
+                "cohort_keys": 5,
                 "reused_keys": 2,
-                "dram_load_events": 3,
+                "load_gpu_ready_key_events": 3,
                 "reused_within_100ms_keys": 1,
                 "reused_within_1s_keys": 2,
             },
-            "latencies": {"first_dram_load": [0.05, 0.4]},
+            "latencies": {"to_first_load_gpu_ready": [0.05, 0.4]},
         }
     )
     scheduler._external_load_stage_latency_stats = defaultdict(list)
@@ -398,29 +398,32 @@ def test_post_ingest_reuse_stats_are_exported():
 
     assert stats is not None
     assert stats.reduce() == {
-        "post_ingest_ingested_keys": 5,
-        "post_ingest_reused_keys": 2,
-        "post_ingest_dram_load_events": 3,
-        "post_ingest_reused_within_100ms_keys": 1,
-        "post_ingest_reused_within_1s_keys": 2,
-        "post_ingest_first_dram_load_latency_count": 2,
-        "post_ingest_first_dram_load_latency_sum": 0.45,
+        "post_store_primary_ready_cohort_keys": 5,
+        "post_store_primary_ready_reused_keys": 2,
+        "post_store_primary_ready_load_gpu_ready_key_events": 3,
+        "post_store_primary_ready_reused_within_100ms_keys": 1,
+        "post_store_primary_ready_reused_within_1s_keys": 2,
+        "post_store_primary_ready_to_first_load_gpu_ready_latency_count": 2,
+        "post_store_primary_ready_to_first_load_gpu_ready_latency_sum": 0.45,
     }
 
 
-def test_post_promotion_reuse_stats_are_exported():
+def test_post_load_primary_published_cross_request_reuse_stats_are_exported():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = SimpleNamespace(
-        take_post_promotion_reuse_stats=lambda: {
+        take_post_load_primary_published_cross_request_reuse_stats=lambda: {
             "counters": {
-                "promoted_keys": 5,
-                "initial_load_events": 5,
+                "cohort_keys": 5,
+                "origin_load_gpu_ready_key_events": 5,
                 "reused_keys": 2,
-                "dram_reuse_events": 3,
+                "reuse_load_gpu_ready_key_events": 3,
                 "reused_within_1s_keys": 1,
                 "reused_within_10s_keys": 2,
             },
-            "latencies": {"first_dram_reuse": [0.4, 2.0]},
+            "latencies": {
+                "load_primary_published_to_first_cross_request_"
+                "load_gpu_ready": [0.4, 2.0]
+            },
         }
     )
     scheduler._external_load_stage_latency_stats = defaultdict(list)
@@ -429,14 +432,20 @@ def test_post_promotion_reuse_stats_are_exported():
 
     assert stats is not None
     assert stats.reduce() == {
-        "post_promotion_promoted_keys": 5,
-        "post_promotion_initial_load_events": 5,
-        "post_promotion_reused_keys": 2,
-        "post_promotion_dram_reuse_events": 3,
-        "post_promotion_reused_within_1s_keys": 1,
-        "post_promotion_reused_within_10s_keys": 2,
-        "post_promotion_first_dram_reuse_latency_count": 2,
-        "post_promotion_first_dram_reuse_latency_sum": 2.4,
+        "post_load_primary_published_cross_request_cohort_keys": 5,
+        "post_load_primary_published_cross_request_origin_load_gpu_ready_key_events": 5,
+        "post_load_primary_published_cross_request_reused_keys": 2,
+        "post_load_primary_published_cross_request_reuse_load_gpu_ready_key_events": 3,
+        "post_load_primary_published_cross_request_reused_within_1s_keys": 1,
+        "post_load_primary_published_cross_request_reused_within_10s_keys": 2,
+        (
+            "post_load_primary_published_to_first_cross_request_"
+            "load_gpu_ready_latency_count"
+        ): 2,
+        (
+            "post_load_primary_published_to_first_cross_request_"
+            "load_gpu_ready_latency_sum"
+        ): 2.4,
     }
 
 

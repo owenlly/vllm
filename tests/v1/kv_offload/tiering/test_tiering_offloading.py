@@ -448,7 +448,7 @@ class TestTieringOffloadingManager:
 
         with patch(
             "vllm.v1.kv_offload.tiering.manager.time.monotonic",
-            side_effect=[30.0, 31.25],
+            side_effect=[30.0, 31.25, 31.5],
         ):
             self._simulate_on_schedule_end()
             self._simulate_on_schedule_end()
@@ -462,7 +462,9 @@ class TestTieringOffloadingManager:
         timing = self.manager.take_completed_promotion_timing(_CTX.req_id)
         assert timing is not None
         assert timing.submitted_at_s == 30.0
-        assert timing.ready_at_s == 31.25
+        # Secondary completion was observed at 31.25, but primary publication
+        # is sampled only after complete_store() publishes the promoted blocks.
+        assert timing.primary_published_at_s == 31.5
         assert self.manager.take_completed_promotion_timing(_CTX.req_id) is None
 
     def test_secondary_tier_task_runtime_stats_track_promotion_jobs(

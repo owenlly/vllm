@@ -65,9 +65,11 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
-    # Scheduler-observed LOAD timing. The end timestamp is recorded only after
-    # every worker reports completion, so TP loads use the critical path.
-    primary_to_gpu_submitted_at_s: float | None = None
+    # Scheduler-observed LOAD timing. The start is sampled immediately after
+    # the scheduler creates/enqueues the logical LOAD job; the end is sampled
+    # only after every worker reports completion, so TP loads use the critical
+    # path. This is not a worker/native transport submission timestamp.
+    load_job_created_at_s: float | None = None
     external_load_started_at_s: float | None = None
 
 
@@ -341,14 +343,14 @@ class OffloadingConnectorScheduler:
         self._job_counter += 1
         return job_id
 
-    def _start_primary_to_gpu_timing(
+    def _start_load_job_created_to_gpu_ready_timing(
         self,
         req_id: str,
         prepare_load_started_at_s: float,
         prepare_load_completed_at_s: float,
     ) -> tuple[float, float | None]:
         assert getattr(self, "_profile_job_breakdown", True)
-        submitted_at_s = time.monotonic()
+        load_job_created_at_s = time.monotonic()
         external_load_started_at_s: float | None = None
         take_promotion_timing = getattr(
             self.manager,
@@ -360,19 +362,25 @@ class OffloadingConnectorScheduler:
             if promotion_timing is not None:
                 external_load_started_at_s = promotion_timing.submitted_at_s
                 self._external_load_stage_latency_stats[
-                    "secondary_to_primary"
+                    "secondary_submit_to_primary_published"
                 ].append(
                     max(
-                        promotion_timing.ready_at_s
+                        promotion_timing.primary_published_at_s
                         - promotion_timing.submitted_at_s,
                         0.0,
                     )
                 )
                 self._external_load_stage_latency_stats["scheduler_gap"].append(
-                    max(submitted_at_s - promotion_timing.ready_at_s, 0.0)
+                    max(
+                        load_job_created_at_s
+                        - promotion_timing.primary_published_at_s,
+                        0.0,
+                    )
                 )
                 revisit_wait_s = max(
-                    prepare_load_started_at_s - promotion_timing.ready_at_s, 0.0
+                    prepare_load_started_at_s
+                    - promotion_timing.primary_published_at_s,
+                    0.0,
                 )
                 self._external_load_stage_latency_stats[
                     "scheduler_revisit_wait"
@@ -380,7 +388,7 @@ class OffloadingConnectorScheduler:
                 if getattr(self, "_profile_scheduler_revisit", False):
                     self._record_scheduler_revisit_breakdown(
                         req_id,
-                        promotion_timing.ready_at_s,
+                        promotion_timing.primary_published_at_s,
                         prepare_load_started_at_s,
                         revisit_wait_s,
                     )
@@ -396,11 +404,11 @@ class OffloadingConnectorScheduler:
                     "scheduler_build_load_spec"
                 ].append(
                     max(
-                        submitted_at_s - prepare_load_completed_at_s,
+                        load_job_created_at_s - prepare_load_completed_at_s,
                         0.0,
                     )
                 )
-        return submitted_at_s, external_load_started_at_s
+        return load_job_created_at_s, external_load_started_at_s
 
     def _record_scheduler_revisit_breakdown(
         self,
@@ -511,21 +519,29 @@ class OffloadingConnectorScheduler:
             max(revisit_wait_s - accounted_wait_s, 0.0)
         )
 
-    def _record_primary_to_gpu_completion(
+    def _record_load_gpu_ready(
         self, job_status: TransferJobStatus
     ) -> None:
         if not getattr(self, "_profile_job_breakdown", True):
             return
         completed_at_s = time.monotonic()
-        assert job_status.primary_to_gpu_submitted_at_s is not None
-        self._external_load_stage_latency_stats["primary_to_gpu"].append(
+        assert job_status.load_job_created_at_s is not None
+        # This scheduler-side interval starts when the logical LOAD job has
+        # been created/enqueued, not when a worker/native transport submits an
+        # RDMA operation. It includes dispatch/worker queueing plus the TP
+        # critical-path transfer through GPU readiness.
+        self._external_load_stage_latency_stats[
+            "scheduler_job_created_to_gpu_ready"
+        ].append(
             max(
-                completed_at_s - job_status.primary_to_gpu_submitted_at_s,
+                completed_at_s - job_status.load_job_created_at_s,
                 0.0,
             )
         )
         if job_status.external_load_started_at_s is not None:
-            self._external_load_stage_latency_stats["end_to_end"].append(
+            self._external_load_stage_latency_stats[
+                "secondary_submit_to_gpu_ready"
+            ].append(
                 max(completed_at_s - job_status.external_load_started_at_s, 0.0)
             )
 
@@ -903,26 +919,27 @@ class OffloadingConnectorScheduler:
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
 
-        if self._profile_job_breakdown:
-            assert prepare_load_started_at_s is not None
-            assert prepare_load_completed_at_s is not None
-            (
-                primary_to_gpu_submitted_at_s,
-                external_load_started_at_s,
-            ) = self._start_primary_to_gpu_timing(
-                request.request_id,
-                prepare_load_started_at_s,
-                prepare_load_completed_at_s,
-            )
-        else:
-            primary_to_gpu_submitted_at_s = None
-            external_load_started_at_s = None
-
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
             transfer_spec=(src_spec, dst_spec),
         )
+
+        if self._profile_job_breakdown:
+            assert prepare_load_started_at_s is not None
+            assert prepare_load_completed_at_s is not None
+            (
+                load_job_created_at_s,
+                external_load_started_at_s,
+            ) = self._start_load_job_created_to_gpu_ready_timing(
+                request.request_id,
+                prepare_load_started_at_s,
+                prepare_load_completed_at_s,
+            )
+        else:
+            load_job_created_at_s = None
+            external_load_started_at_s = None
+
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
@@ -931,7 +948,7 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
-            primary_to_gpu_submitted_at_s=primary_to_gpu_submitted_at_s,
+            load_job_created_at_s=load_job_created_at_s,
             external_load_started_at_s=external_load_started_at_s,
         )
 
@@ -1249,7 +1266,7 @@ class OffloadingConnectorScheduler:
                 )
             else:
                 if success:
-                    self._record_primary_to_gpu_completion(job_status)
+                    self._record_load_gpu_ready(job_status)
                     self.manager.complete_load(
                         job_status.keys, req_status.req_context
                     )
@@ -1336,7 +1353,7 @@ class OffloadingConnectorScheduler:
         stats = OffloadingConnectorStats()
         if hasattr(self.manager, "get_usage_stats"):
             used_blocks, total_blocks = self.manager.get_usage_stats()
-            stats.record_cpu_cache_usage(
+            stats.record_primary_cache_usage(
                 used_blocks=used_blocks,
                 total_blocks=total_blocks,
             )
@@ -1367,17 +1384,23 @@ class OffloadingConnectorScheduler:
             stats.record_fused_store_stage_latency_stats(
                 fused_store_latency_stats
             )
-        if hasattr(self.manager, "take_post_ingest_reuse_stats"):
-            post_ingest_reuse_stats = (
-                self.manager.take_post_ingest_reuse_stats()
+        if hasattr(self.manager, "take_post_store_primary_ready_reuse_stats"):
+            post_store_primary_ready_reuse_stats = (
+                self.manager.take_post_store_primary_ready_reuse_stats()
             )
-            stats.record_post_ingest_reuse_stats(post_ingest_reuse_stats)
-        if hasattr(self.manager, "take_post_promotion_reuse_stats"):
-            post_promotion_reuse_stats = (
-                self.manager.take_post_promotion_reuse_stats()
+            stats.record_post_store_primary_ready_reuse_stats(
+                post_store_primary_ready_reuse_stats
             )
-            stats.record_post_promotion_reuse_stats(
-                post_promotion_reuse_stats
+        if hasattr(
+            self.manager,
+            "take_post_load_primary_published_cross_request_reuse_stats",
+        ):
+            post_load_primary_published_cross_request_reuse_stats = (
+                self.manager
+                .take_post_load_primary_published_cross_request_reuse_stats()
+            )
+            stats.record_post_load_primary_published_cross_request_reuse_stats(
+                post_load_primary_published_cross_request_reuse_stats
             )
         if self._external_load_stage_latency_stats:
             stats.record_external_load_stage_latency_stats(

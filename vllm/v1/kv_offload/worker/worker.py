@@ -22,6 +22,10 @@ class TransferResult:
     transfer_time: float | None = None
     transfer_type: TransferType | None = None
     rdma_stats: dict[str, int] | None = None
+    # Optional rank-local fused LOAD stage durations, in seconds. Connector-
+    # specific handlers may populate this without changing the generic
+    # transfer interface for other backends.
+    fused_load_stage_latencies: dict[str, float] | None = None
 
 
 class OffloadingHandler(ABC):

@@ -99,10 +99,10 @@ def test_aggregate_same_connector():
 
 
 def test_aggregate_rdma_transport_stats():
-    """Actual verbs counters are summed by operation across TP workers."""
+    """RDMA counters are summed by logical STORE/LOAD across TP workers."""
     stats1 = OffloadingConnectorStats()
     stats1.record_rdma_transport_stats(
-        "write",
+        "store",
         {
             "logical_requests": 10,
             "wr_posted": 4,
@@ -113,7 +113,7 @@ def test_aggregate_rdma_transport_stats():
     )
     stats2 = OffloadingConnectorStats()
     stats2.record_rdma_transport_stats(
-        "write",
+        "store",
         {
             "logical_requests": 6,
             "wr_posted": 3,
@@ -123,7 +123,7 @@ def test_aggregate_rdma_transport_stats():
         },
     )
     stats2.record_rdma_transport_stats(
-        "read",
+        "load",
         {
             "logical_requests": 2,
             "wr_posted": 2,
@@ -135,16 +135,16 @@ def test_aggregate_rdma_transport_stats():
 
     reduced = stats1.aggregate(stats2).reduce()
 
-    assert reduced["rdma_write_logical_requests"] == 16
-    assert reduced["rdma_write_wr_posted"] == 7
-    assert reduced["rdma_write_sge_posted"] == 32
-    assert reduced["rdma_write_multi_sge_wr"] == 7
-    assert reduced["rdma_write_wr_split"] == 1
-    assert reduced["rdma_read_logical_requests"] == 2
-    assert reduced["rdma_read_wr_posted"] == 2
-    assert reduced["rdma_read_sge_posted"] == 8
-    assert reduced["rdma_read_multi_sge_wr"] == 2
-    assert reduced["rdma_read_wr_split"] == 0
+    assert reduced["rdma_store_logical_requests"] == 16
+    assert reduced["rdma_store_wr_posted"] == 7
+    assert reduced["rdma_store_sge_posted"] == 32
+    assert reduced["rdma_store_multi_sge_wr"] == 7
+    assert reduced["rdma_store_wr_split"] == 1
+    assert reduced["rdma_load_logical_requests"] == 2
+    assert reduced["rdma_load_wr_posted"] == 2
+    assert reduced["rdma_load_sge_posted"] == 8
+    assert reduced["rdma_load_multi_sge_wr"] == 2
+    assert reduced["rdma_load_wr_split"] == 0
 
 
 def test_aggregate_secondary_tier_stats():
@@ -246,35 +246,61 @@ def test_aggregate_external_load_stage_latency_stats():
     stats1 = OffloadingConnectorStats()
     stats1.record_external_load_stage_latency_stats(
         {
-            "secondary_to_primary": [0.3],
+            "secondary_submit_to_primary_published": [0.3],
             "scheduler_gap": [0.02],
-            "primary_to_gpu": [0.04],
-            "end_to_end": [0.36],
+            "scheduler_job_created_to_gpu_ready": [0.04],
+            "secondary_submit_to_gpu_ready": [0.36],
         }
     )
     stats2 = OffloadingConnectorStats()
     stats2.record_external_load_stage_latency_stats(
         {
-            "secondary_to_primary": [0.5],
+            "secondary_submit_to_primary_published": [0.5],
             "scheduler_gap": [0.03],
-            "primary_to_gpu": [0.07],
-            "end_to_end": [0.6],
+            "scheduler_job_created_to_gpu_ready": [0.07],
+            "secondary_submit_to_gpu_ready": [0.6],
         }
     )
 
     reduced = stats1.aggregate(stats2).reduce()
 
-    assert reduced["external_load_secondary_to_primary_latency_count"] == 2
-    assert reduced["external_load_secondary_to_primary_latency_sum"] == 0.8
+    assert (
+        reduced[
+            "external_load_secondary_submit_to_primary_published_latency_count"
+        ]
+        == 2
+    )
+    assert (
+        reduced[
+            "external_load_secondary_submit_to_primary_published_latency_sum"
+        ]
+        == 0.8
+    )
     assert reduced["external_load_scheduler_gap_latency_count"] == 2
     assert reduced["external_load_scheduler_gap_latency_sum"] == 0.05
-    assert reduced["external_load_primary_to_gpu_latency_count"] == 2
     assert (
-        abs(reduced["external_load_primary_to_gpu_latency_sum"] - 0.11)
+        reduced[
+            "external_load_scheduler_job_created_to_gpu_ready_latency_count"
+        ]
+        == 2
+    )
+    assert (
+        abs(
+            reduced[
+                "external_load_scheduler_job_created_to_gpu_ready_latency_sum"
+            ]
+            - 0.11
+        )
         < 1e-12
     )
-    assert reduced["external_load_end_to_end_latency_count"] == 2
-    assert abs(reduced["external_load_end_to_end_latency_sum"] - 0.96) < 1e-12
+    assert reduced["external_load_secondary_submit_to_gpu_ready_latency_count"] == 2
+    assert (
+        abs(
+            reduced["external_load_secondary_submit_to_gpu_ready_latency_sum"]
+            - 0.96
+        )
+        < 1e-12
+    )
 
 
 def test_aggregate_fused_store_stage_latency_stats():
@@ -282,127 +308,253 @@ def test_aggregate_fused_store_stage_latency_stats():
     stats1 = OffloadingConnectorStats()
     stats1.record_fused_store_stage_latency_stats(
         {
-            "ingest_latency": [0.1],
-            "gpu_pin_duration": [0.11],
-            "persist_latency": [0.3],
-            "publish_latency": [0.02],
+            "prepared_to_primary_ready": [0.1],
+            "prepared_to_gpu_source_release_ready": [0.11],
+            "primary_ready_to_primary_to_secondary_done": [0.3],
+            "primary_to_secondary_done_to_secondary_ready": [0.02],
         }
     )
     stats2 = OffloadingConnectorStats()
     stats2.record_fused_store_stage_latency_stats(
         {
-            "ingest_latency": [0.2],
-            "gpu_pin_duration": [0.21],
-            "persist_latency": [0.4],
-            "publish_latency": [0.03],
+            "prepared_to_primary_ready": [0.2],
+            "prepared_to_gpu_source_release_ready": [0.21],
+            "primary_ready_to_primary_to_secondary_done": [0.4],
+            "primary_to_secondary_done_to_secondary_ready": [0.03],
         }
     )
 
     reduced = stats1.aggregate(stats2).reduce()
 
-    assert reduced["fused_store_ingest_latency_count"] == 2
-    assert abs(reduced["fused_store_ingest_latency_sum"] - 0.3) < 1e-12
-    assert reduced["fused_store_gpu_pin_duration_count"] == 2
     assert (
-        abs(reduced["fused_store_gpu_pin_duration_sum"] - 0.32) < 1e-12
+        reduced[
+            "fused_store_prepared_to_primary_ready_latency_count"
+        ]
+        == 2
     )
-    assert reduced["fused_store_persist_latency_count"] == 2
-    assert abs(reduced["fused_store_persist_latency_sum"] - 0.7) < 1e-12
-    assert reduced["fused_store_publish_latency_count"] == 2
-    assert abs(reduced["fused_store_publish_latency_sum"] - 0.05) < 1e-12
+    assert (
+        abs(
+            reduced[
+                "fused_store_prepared_to_primary_ready_latency_sum"
+            ]
+            - 0.3
+        )
+        < 1e-12
+    )
+    assert (
+        reduced[
+            "fused_store_prepared_to_gpu_source_release_ready_latency_count"
+        ]
+        == 2
+    )
+    assert (
+        abs(
+            reduced[
+                "fused_store_prepared_to_gpu_source_release_ready_latency_sum"
+            ]
+            - 0.32
+        )
+        < 1e-12
+    )
+    assert (
+        reduced[
+            "fused_store_primary_ready_to_primary_to_secondary_done_latency_count"
+        ]
+        == 2
+    )
+    assert (
+        abs(
+            reduced[
+                "fused_store_primary_ready_to_primary_to_secondary_done_latency_sum"
+            ]
+            - 0.7
+        )
+        < 1e-12
+    )
+    assert (
+        reduced[
+            "fused_store_primary_to_secondary_done_to_secondary_ready_latency_count"
+        ]
+        == 2
+    )
+    assert (
+        abs(
+            reduced[
+                "fused_store_primary_to_secondary_done_to_secondary_ready_latency_sum"
+            ]
+            - 0.05
+        )
+        < 1e-12
+    )
 
 
-def test_aggregate_post_ingest_reuse_stats():
-    """Post-ingest logical-key counters and first reuse latency aggregate."""
+def test_aggregate_fused_load_stage_latency_stats():
+    """Rank-local fused LOAD stage samples aggregate across workers."""
     stats1 = OffloadingConnectorStats()
-    stats1.record_post_ingest_reuse_stats(
+    stats1.record_fused_load_stage_latency_stats(
+        {
+            "secondary_to_primary": [0.1],
+            "primary_to_gpu": [0.2],
+            "dpu_total": [0.3],
+            "command_round_trip": [0.31],
+            "gpu_visibility": [0.01],
+            "worker_total": [0.33],
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_fused_load_stage_latency_stats(
+        {
+            # A Primary-resident LOAD intentionally omits this stage.
+            "primary_to_gpu": [0.4],
+            "dpu_total": [0.4],
+            "command_round_trip": [0.42],
+            "gpu_visibility": [0.02],
+            "worker_total": [0.45],
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["fused_load_secondary_to_primary_latency_count"] == 1
+    assert reduced["fused_load_secondary_to_primary_latency_sum"] == 0.1
+    assert reduced["fused_load_primary_to_gpu_latency_count"] == 2
+    assert abs(reduced["fused_load_primary_to_gpu_latency_sum"] - 0.6) < 1e-12
+    assert reduced["fused_load_dpu_total_latency_count"] == 2
+    assert abs(reduced["fused_load_dpu_total_latency_sum"] - 0.7) < 1e-12
+    assert reduced["fused_load_command_round_trip_latency_count"] == 2
+    assert (
+        abs(reduced["fused_load_command_round_trip_latency_sum"] - 0.73)
+        < 1e-12
+    )
+    assert reduced["fused_load_gpu_visibility_latency_count"] == 2
+    assert (
+        abs(reduced["fused_load_gpu_visibility_latency_sum"] - 0.03)
+        < 1e-12
+    )
+    assert reduced["fused_load_worker_total_latency_count"] == 2
+    assert abs(reduced["fused_load_worker_total_latency_sum"] - 0.78) < 1e-12
+
+
+def test_aggregate_post_store_primary_ready_reuse_stats():
+    """Post-STORE_PRIMARY_READY counters and first reuse latency aggregate."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_post_store_primary_ready_reuse_stats(
         {
             "counters": {
-                "ingested_keys": 10,
+                "cohort_keys": 10,
                 "reused_keys": 4,
-                "dram_load_events": 6,
+                "load_gpu_ready_key_events": 6,
                 "evicted_without_reuse_keys": 2,
                 "reused_within_100ms_keys": 1,
                 "reused_within_1s_keys": 2,
                 "reused_within_10s_keys": 4,
                 "reused_within_60s_keys": 4,
             },
-            "latencies": {"first_dram_load": [0.05, 0.5]},
+            "latencies": {"to_first_load_gpu_ready": [0.05, 0.5]},
         }
     )
     stats2 = OffloadingConnectorStats()
-    stats2.record_post_ingest_reuse_stats(
+    stats2.record_post_store_primary_ready_reuse_stats(
         {
             "counters": {
-                "ingested_keys": 3,
+                "cohort_keys": 3,
                 "reused_keys": 1,
-                "dram_load_events": 2,
+                "load_gpu_ready_key_events": 2,
                 "reused_within_100ms_keys": 0,
                 "reused_within_1s_keys": 0,
                 "reused_within_10s_keys": 1,
                 "reused_within_60s_keys": 1,
             },
-            "latencies": {"first_dram_load": [2.0]},
+            "latencies": {"to_first_load_gpu_ready": [2.0]},
         }
     )
 
     reduced = stats1.aggregate(stats2).reduce()
 
-    assert reduced["post_ingest_ingested_keys"] == 13
-    assert reduced["post_ingest_reused_keys"] == 5
-    assert reduced["post_ingest_dram_load_events"] == 8
-    assert reduced["post_ingest_evicted_without_reuse_keys"] == 2
-    assert reduced["post_ingest_reused_within_100ms_keys"] == 1
-    assert reduced["post_ingest_reused_within_1s_keys"] == 2
-    assert reduced["post_ingest_reused_within_10s_keys"] == 5
-    assert reduced["post_ingest_reused_within_60s_keys"] == 5
-    assert reduced["post_ingest_first_dram_load_latency_count"] == 3
-    assert reduced["post_ingest_first_dram_load_latency_sum"] == 2.55
+    assert reduced["post_store_primary_ready_cohort_keys"] == 13
+    assert reduced["post_store_primary_ready_reused_keys"] == 5
+    assert reduced["post_store_primary_ready_load_gpu_ready_key_events"] == 8
+    assert reduced["post_store_primary_ready_evicted_without_reuse_keys"] == 2
+    assert reduced["post_store_primary_ready_reused_within_100ms_keys"] == 1
+    assert reduced["post_store_primary_ready_reused_within_1s_keys"] == 2
+    assert reduced["post_store_primary_ready_reused_within_10s_keys"] == 5
+    assert reduced["post_store_primary_ready_reused_within_60s_keys"] == 5
+    assert (
+        reduced[
+            "post_store_primary_ready_to_first_load_gpu_ready_latency_count"
+        ]
+        == 3
+    )
+    assert (
+        reduced[
+            "post_store_primary_ready_to_first_load_gpu_ready_latency_sum"
+        ]
+        == 2.55
+    )
 
 
-def test_aggregate_post_promotion_reuse_stats():
-    """Promotion consumption is separate from subsequent DRAM reuse."""
+def test_aggregate_post_load_primary_published_cross_request_reuse_stats():
+    """The origin LOAD is separate from later cross-request reuse."""
     stats1 = OffloadingConnectorStats()
-    stats1.record_post_promotion_reuse_stats(
+    stats1.record_post_load_primary_published_cross_request_reuse_stats(
         {
             "counters": {
-                "promoted_keys": 10,
-                "initial_load_events": 9,
+                "cohort_keys": 10,
+                "origin_load_gpu_ready_key_events": 9,
                 "reused_keys": 3,
-                "dram_reuse_events": 5,
+                "reuse_load_gpu_ready_key_events": 5,
                 "evicted_without_reuse_keys": 6,
                 "reused_within_1s_keys": 2,
                 "reused_within_10s_keys": 3,
             },
-            "latencies": {"first_dram_reuse": [0.5, 2.0]},
+            "latencies": {
+                "load_primary_published_to_first_cross_request_"
+                "load_gpu_ready": [0.5, 2.0]
+            },
         }
     )
     stats2 = OffloadingConnectorStats()
-    stats2.record_post_promotion_reuse_stats(
+    stats2.record_post_load_primary_published_cross_request_reuse_stats(
         {
             "counters": {
-                "promoted_keys": 2,
-                "initial_load_events": 2,
+                "cohort_keys": 2,
+                "origin_load_gpu_ready_key_events": 2,
                 "reused_keys": 1,
-                "dram_reuse_events": 1,
+                "reuse_load_gpu_ready_key_events": 1,
                 "reused_within_1s_keys": 1,
                 "reused_within_10s_keys": 1,
             },
-            "latencies": {"first_dram_reuse": [0.25]},
+            "latencies": {
+                "load_primary_published_to_first_cross_request_"
+                "load_gpu_ready": [0.25]
+            },
         }
     )
 
     reduced = stats1.aggregate(stats2).reduce()
 
-    assert reduced["post_promotion_promoted_keys"] == 12
-    assert reduced["post_promotion_initial_load_events"] == 11
-    assert reduced["post_promotion_reused_keys"] == 4
-    assert reduced["post_promotion_dram_reuse_events"] == 6
-    assert reduced["post_promotion_evicted_without_reuse_keys"] == 6
-    assert reduced["post_promotion_reused_within_1s_keys"] == 3
-    assert reduced["post_promotion_reused_within_10s_keys"] == 4
-    assert reduced["post_promotion_first_dram_reuse_latency_count"] == 3
-    assert reduced["post_promotion_first_dram_reuse_latency_sum"] == 2.75
+    prefix = "post_load_primary_published_cross_request"
+    assert reduced[f"{prefix}_cohort_keys"] == 12
+    assert reduced[f"{prefix}_origin_load_gpu_ready_key_events"] == 11
+    assert reduced[f"{prefix}_reused_keys"] == 4
+    assert reduced[f"{prefix}_reuse_load_gpu_ready_key_events"] == 6
+    assert reduced[f"{prefix}_evicted_without_reuse_keys"] == 6
+    assert reduced[f"{prefix}_reused_within_1s_keys"] == 3
+    assert reduced[f"{prefix}_reused_within_10s_keys"] == 4
+    assert (
+        reduced[
+            "post_load_primary_published_to_first_cross_request_"
+            "load_gpu_ready_latency_count"
+        ]
+        == 3
+    )
+    assert (
+        reduced[
+            "post_load_primary_published_to_first_cross_request_"
+            "load_gpu_ready_latency_sum"
+        ]
+        == 2.75
+    )
 
 
 def test_aggregate_secondary_tier_task_runtime_stats():

@@ -63,10 +63,10 @@ class PendingPromotion:
 
 @dataclass(frozen=True, slots=True)
 class CompletedPromotionTiming:
-    """Request-visible timing for a completed secondary promotion."""
+    """Timing from secondary submission through primary publication."""
 
     submitted_at_s: float
-    ready_at_s: float
+    primary_published_at_s: float
 
 
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
@@ -428,12 +428,23 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    # Primary publication is reached only after
+                    # complete_store() and the completion hook publish the
+                    # promoted blocks. Keep completed_at_s above for secondary
+                    # job runtime, but do not report it as the request-visible
+                    # publication boundary.
+                    primary_published_at_s = (
+                        time.monotonic()
+                        if completed_job.success
+                        and self.profile_job_breakdown
+                        else None
+                    )
                     self._record_secondary_tier_job(
                         operation,
                         status,
                         len(job_metadata.keys),
                     )
-                    if completed_job.success and self.profile_job_breakdown:
+                    if primary_published_at_s is not None:
                         req_id = job_metadata.req_context.req_id
                         previous = self._completed_promotion_timings.get(req_id)
                         submitted_at_s = job_metadata.submitted_at_s
@@ -445,7 +456,9 @@ class TieringOffloadingManager(OffloadingManager):
                         self._completed_promotion_timings[req_id] = (
                             CompletedPromotionTiming(
                                 submitted_at_s=submitted_at_s,
-                                ready_at_s=completed_at_s,
+                                primary_published_at_s=(
+                                    primary_published_at_s
+                                ),
                             )
                         )
                     else:
