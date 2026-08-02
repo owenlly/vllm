@@ -312,6 +312,99 @@ def test_aggregate_fused_store_stage_latency_stats():
     assert abs(reduced["fused_store_publish_latency_sum"] - 0.05) < 1e-12
 
 
+def test_aggregate_post_ingest_reuse_stats():
+    """Post-ingest logical-key counters and first reuse latency aggregate."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_post_ingest_reuse_stats(
+        {
+            "counters": {
+                "ingested_keys": 10,
+                "reused_keys": 4,
+                "dram_load_events": 6,
+                "evicted_without_reuse_keys": 2,
+                "reused_within_100ms_keys": 1,
+                "reused_within_1s_keys": 2,
+                "reused_within_10s_keys": 4,
+                "reused_within_60s_keys": 4,
+            },
+            "latencies": {"first_dram_load": [0.05, 0.5]},
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_post_ingest_reuse_stats(
+        {
+            "counters": {
+                "ingested_keys": 3,
+                "reused_keys": 1,
+                "dram_load_events": 2,
+                "reused_within_100ms_keys": 0,
+                "reused_within_1s_keys": 0,
+                "reused_within_10s_keys": 1,
+                "reused_within_60s_keys": 1,
+            },
+            "latencies": {"first_dram_load": [2.0]},
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["post_ingest_ingested_keys"] == 13
+    assert reduced["post_ingest_reused_keys"] == 5
+    assert reduced["post_ingest_dram_load_events"] == 8
+    assert reduced["post_ingest_evicted_without_reuse_keys"] == 2
+    assert reduced["post_ingest_reused_within_100ms_keys"] == 1
+    assert reduced["post_ingest_reused_within_1s_keys"] == 2
+    assert reduced["post_ingest_reused_within_10s_keys"] == 5
+    assert reduced["post_ingest_reused_within_60s_keys"] == 5
+    assert reduced["post_ingest_first_dram_load_latency_count"] == 3
+    assert reduced["post_ingest_first_dram_load_latency_sum"] == 2.55
+
+
+def test_aggregate_post_promotion_reuse_stats():
+    """Promotion consumption is separate from subsequent DRAM reuse."""
+    stats1 = OffloadingConnectorStats()
+    stats1.record_post_promotion_reuse_stats(
+        {
+            "counters": {
+                "promoted_keys": 10,
+                "initial_load_events": 9,
+                "reused_keys": 3,
+                "dram_reuse_events": 5,
+                "evicted_without_reuse_keys": 6,
+                "reused_within_1s_keys": 2,
+                "reused_within_10s_keys": 3,
+            },
+            "latencies": {"first_dram_reuse": [0.5, 2.0]},
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_post_promotion_reuse_stats(
+        {
+            "counters": {
+                "promoted_keys": 2,
+                "initial_load_events": 2,
+                "reused_keys": 1,
+                "dram_reuse_events": 1,
+                "reused_within_1s_keys": 1,
+                "reused_within_10s_keys": 1,
+            },
+            "latencies": {"first_dram_reuse": [0.25]},
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["post_promotion_promoted_keys"] == 12
+    assert reduced["post_promotion_initial_load_events"] == 11
+    assert reduced["post_promotion_reused_keys"] == 4
+    assert reduced["post_promotion_dram_reuse_events"] == 6
+    assert reduced["post_promotion_evicted_without_reuse_keys"] == 6
+    assert reduced["post_promotion_reused_within_1s_keys"] == 3
+    assert reduced["post_promotion_reused_within_10s_keys"] == 4
+    assert reduced["post_promotion_first_dram_reuse_latency_count"] == 3
+    assert reduced["post_promotion_first_dram_reuse_latency_sum"] == 2.75
+
+
 def test_aggregate_secondary_tier_task_runtime_stats():
     """Test that secondary tier task CPU/wall time counters are summed."""
     stats1 = OffloadingConnectorStats()

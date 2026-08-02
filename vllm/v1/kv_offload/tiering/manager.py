@@ -384,6 +384,14 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = True
         self._process_finished_jobs()
 
+    def _on_promotion_completed(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool,
+    ) -> None:
+        """Hook invoked after a secondary-to-primary promotion completes."""
+
     def _process_finished_jobs(self):
         """
         Unconditionally poll all secondary tiers for completed jobs.
@@ -411,6 +419,11 @@ class TieringOffloadingManager(OffloadingManager):
                     # secondary→primary transfer (promotion) completed.
                     # Make blocks available in primary tier.
                     self.primary_tier.complete_store(
+                        job_metadata.keys,
+                        job_metadata.req_context,
+                        completed_job.success,
+                    )
+                    self._on_promotion_completed(
                         job_metadata.keys,
                         job_metadata.req_context,
                         completed_job.success,

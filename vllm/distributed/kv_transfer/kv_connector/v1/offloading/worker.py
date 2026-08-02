@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
     OffloadingSpec,
 )
 from vllm.v1.kv_offload.worker.worker import (
@@ -45,8 +46,9 @@ class OffloadingConnectorWorker:
         self.worker = OffloadingWorker()
 
         self.kv_connector_stats = OffloadingConnectorStats()
-        # job_id -> req_id for in-flight loads.
-        self._load_jobs: dict[int, ReqId] = {}
+        # job_id -> (req_id, destination GPU block IDs) for in-flight loads.
+        self._load_jobs: dict[int, tuple[ReqId, tuple[int, ...]]] = {}
+        self._invalid_load_block_ids: set[int] = set()
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
 
@@ -245,7 +247,13 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
-            self._load_jobs[job_id] = entry.req_id
+            dst_spec = entry.transfer_spec[1]
+            if not isinstance(dst_spec, GPULoadStoreSpec):
+                raise TypeError("LOAD destination must be GPU block metadata")
+            self._load_jobs[job_id] = (
+                entry.req_id,
+                tuple(int(block_id) for block_id in dst_spec.block_ids),
+            )
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
 
@@ -268,11 +276,10 @@ class OffloadingConnectorWorker:
         """
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             if (
-                transfer_result.transfer_time
+                transfer_result.success
+                and transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
                 and transfer_result.transfer_type is not None
             ):
@@ -296,19 +303,32 @@ class OffloadingConnectorWorker:
                     )
 
             self._connector_worker_meta.mark_completed(job_id)
-            req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            if not transfer_result.success:
+                self._connector_worker_meta.mark_failed(job_id)
+            load = self._load_jobs.pop(job_id, None)
+            if load is not None:
+                req_id, gpu_block_ids = load
+                if not transfer_result.success:
+                    self._invalid_load_block_ids.update(gpu_block_ids)
                 finished_recving.add(req_id)
 
         return set(), finished_recving
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        if (
+            not self._connector_worker_meta.completed_jobs
+            and not self._connector_worker_meta.failed_jobs
+        ):
             return None
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()
         return meta
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        invalid = self._invalid_load_block_ids
+        self._invalid_load_block_ids = set()
+        return invalid
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """
@@ -325,5 +345,6 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._invalid_load_block_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self.worker.shutdown()

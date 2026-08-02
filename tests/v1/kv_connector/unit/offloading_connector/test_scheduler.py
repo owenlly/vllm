@@ -378,6 +378,68 @@ def test_fused_store_stage_latency_stats_are_exported():
     }
 
 
+def test_post_ingest_reuse_stats_are_exported():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace(
+        take_post_ingest_reuse_stats=lambda: {
+            "counters": {
+                "ingested_keys": 5,
+                "reused_keys": 2,
+                "dram_load_events": 3,
+                "reused_within_100ms_keys": 1,
+                "reused_within_1s_keys": 2,
+            },
+            "latencies": {"first_dram_load": [0.05, 0.4]},
+        }
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "post_ingest_ingested_keys": 5,
+        "post_ingest_reused_keys": 2,
+        "post_ingest_dram_load_events": 3,
+        "post_ingest_reused_within_100ms_keys": 1,
+        "post_ingest_reused_within_1s_keys": 2,
+        "post_ingest_first_dram_load_latency_count": 2,
+        "post_ingest_first_dram_load_latency_sum": 0.45,
+    }
+
+
+def test_post_promotion_reuse_stats_are_exported():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace(
+        take_post_promotion_reuse_stats=lambda: {
+            "counters": {
+                "promoted_keys": 5,
+                "initial_load_events": 5,
+                "reused_keys": 2,
+                "dram_reuse_events": 3,
+                "reused_within_1s_keys": 1,
+                "reused_within_10s_keys": 2,
+            },
+            "latencies": {"first_dram_reuse": [0.4, 2.0]},
+        }
+    )
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "post_promotion_promoted_keys": 5,
+        "post_promotion_initial_load_events": 5,
+        "post_promotion_reused_keys": 2,
+        "post_promotion_dram_reuse_events": 3,
+        "post_promotion_reused_within_1s_keys": 1,
+        "post_promotion_reused_within_10s_keys": 2,
+        "post_promotion_first_dram_reuse_latency_count": 2,
+        "post_promotion_first_dram_reuse_latency_sum": 2.4,
+    }
+
+
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_request_preemption(request_runner, async_scheduling: bool):
     block_size = 4

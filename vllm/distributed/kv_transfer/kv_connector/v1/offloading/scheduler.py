@@ -57,6 +57,8 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Number of workers that reported an unsuccessful completion.
+    failed_count: int = 0
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
     non_sliding_window_block_ids: list[int] | None = None
@@ -1231,17 +1233,30 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            job_status.failed_count += meta.failed_jobs.get(job_id, 0)
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
+            success = job_status.failed_count == 0
             if job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                self.manager.complete_store(
+                    job_status.keys,
+                    req_status.req_context,
+                    success=success,
+                )
             else:
-                self._record_primary_to_gpu_completion(job_status)
-                self.manager.complete_load(job_status.keys, req_status.req_context)
+                if success:
+                    self._record_primary_to_gpu_completion(job_status)
+                    self.manager.complete_load(
+                        job_status.keys, req_status.req_context
+                    )
+                else:
+                    self.manager.abort_load(
+                        job_status.keys, req_status.req_context
+                    )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -1351,6 +1366,18 @@ class OffloadingConnectorScheduler:
             )
             stats.record_fused_store_stage_latency_stats(
                 fused_store_latency_stats
+            )
+        if hasattr(self.manager, "take_post_ingest_reuse_stats"):
+            post_ingest_reuse_stats = (
+                self.manager.take_post_ingest_reuse_stats()
+            )
+            stats.record_post_ingest_reuse_stats(post_ingest_reuse_stats)
+        if hasattr(self.manager, "take_post_promotion_reuse_stats"):
+            post_promotion_reuse_stats = (
+                self.manager.take_post_promotion_reuse_stats()
+            )
+            stats.record_post_promotion_reuse_stats(
+                post_promotion_reuse_stats
             )
         if self._external_load_stage_latency_stats:
             stats.record_external_load_stage_latency_stats(

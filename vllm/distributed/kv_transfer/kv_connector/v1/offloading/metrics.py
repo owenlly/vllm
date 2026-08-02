@@ -23,6 +23,29 @@ TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
 FUSED_STORE_STAGE_LATENCY_STATS_KEY = "fused_store_stage_latency_stats"
+POST_INGEST_REUSE_STATS_KEY = "post_ingest_reuse_stats"
+POST_INGEST_REUSE_COUNTER_NAMES = (
+    "ingested_keys",
+    "reused_keys",
+    "dram_load_events",
+    "evicted_without_reuse_keys",
+    "reused_within_100ms_keys",
+    "reused_within_1s_keys",
+    "reused_within_10s_keys",
+    "reused_within_60s_keys",
+)
+POST_PROMOTION_REUSE_STATS_KEY = "post_promotion_reuse_stats"
+POST_PROMOTION_REUSE_COUNTER_NAMES = (
+    "promoted_keys",
+    "initial_load_events",
+    "reused_keys",
+    "dram_reuse_events",
+    "evicted_without_reuse_keys",
+    "reused_within_100ms_keys",
+    "reused_within_1s_keys",
+    "reused_within_10s_keys",
+    "reused_within_60s_keys",
+)
 RDMA_TRANSPORT_STATS_KEY = "rdma_transport_stats"
 RDMA_TRANSPORT_STAT_NAMES = (
     "logical_requests",
@@ -75,6 +98,12 @@ class OffloadingConnectorStats(KVConnectorStats):
                     continue
                 if k == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_fused_store_stage_latency_stats(v)
+                    continue
+                if k == POST_INGEST_REUSE_STATS_KEY:
+                    self._aggregate_reuse_stats(k, v)
+                    continue
+                if k == POST_PROMOTION_REUSE_STATS_KEY:
+                    self._aggregate_reuse_stats(k, v)
                     continue
                 if k == RDMA_TRANSPORT_STATS_KEY:
                     self._aggregate_rdma_transport_stats(v)
@@ -177,6 +206,43 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
 
+    def _aggregate_reuse_stats(
+        self, stats_key: str, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(stats_key, {})
+        assert isinstance(accumulator, dict)
+        output_counters = accumulator.setdefault("counters", {})
+        output_latencies = accumulator.setdefault("latencies", {})
+        assert isinstance(output_counters, dict)
+        assert isinstance(output_latencies, dict)
+        counters = stats.get("counters", {})
+        latencies = stats.get("latencies", {})
+        assert isinstance(counters, dict)
+        assert isinstance(latencies, dict)
+        for name, value in counters.items():
+            output_counters[name] = output_counters.get(name, 0) + value
+        for stage, samples in latencies.items():
+            stage_samples = output_latencies.setdefault(stage, [])
+            assert isinstance(stage_samples, list)
+            stage_samples.extend(samples)
+
+    @staticmethod
+    def _reduce_reuse_stats(
+        output: dict[str, int | float],
+        prefix: str,
+        stats: dict[str, Any],
+    ) -> None:
+        counters = stats.get("counters", {})
+        latencies = stats.get("latencies", {})
+        assert isinstance(counters, dict)
+        assert isinstance(latencies, dict)
+        for name, value in counters.items():
+            output[f"{prefix}_{name}"] = value
+        for stage, samples in latencies.items():
+            assert isinstance(samples, list)
+            output[f"{prefix}_{stage}_latency_count"] = len(samples)
+            output[f"{prefix}_{stage}_latency_sum"] = sum(samples)
+
     def _aggregate_rdma_transport_stats(
         self, stats: dict[str, Any]
     ) -> None:
@@ -267,6 +333,16 @@ class OffloadingConnectorStats(KVConnectorStats):
                     return_dict[f"fused_store_{stage}_count"] = len(latencies)
                     return_dict[f"fused_store_{stage}_sum"] = sum(latencies)
                 continue
+            if transfer_type == POST_INGEST_REUSE_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                self._reduce_reuse_stats(return_dict, "post_ingest", ops_list)
+                continue
+            if transfer_type == POST_PROMOTION_REUSE_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                self._reduce_reuse_stats(
+                    return_dict, "post_promotion", ops_list
+                )
+                continue
             if transfer_type == RDMA_TRANSPORT_STATS_KEY:
                 assert isinstance(ops_list, dict)
                 for operation, operation_stats in ops_list.items():
@@ -353,6 +429,40 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_fused_store_stage_latency_stats(stats)
 
+    def record_post_ingest_reuse_stats(self, stats: dict[str, Any]) -> None:
+        self._record_reuse_stats(
+            stats,
+            stats_key=POST_INGEST_REUSE_STATS_KEY,
+            allowed_names=POST_INGEST_REUSE_COUNTER_NAMES,
+            label="post-ingest",
+        )
+
+    def record_post_promotion_reuse_stats(self, stats: dict[str, Any]) -> None:
+        self._record_reuse_stats(
+            stats,
+            stats_key=POST_PROMOTION_REUSE_STATS_KEY,
+            allowed_names=POST_PROMOTION_REUSE_COUNTER_NAMES,
+            label="post-promotion",
+        )
+
+    def _record_reuse_stats(
+        self,
+        stats: dict[str, Any],
+        *,
+        stats_key: str,
+        allowed_names: tuple[str, ...],
+        label: str,
+    ) -> None:
+        if not stats:
+            return
+        counters = stats.get("counters", {})
+        unknown_names = set(counters).difference(allowed_names)
+        if unknown_names:
+            raise ValueError(
+                f"unknown {label} reuse counters: {sorted(unknown_names)}"
+            )
+        self._aggregate_reuse_stats(stats_key, stats)
+
     def record_rdma_transport_stats(
         self,
         operation: str,
@@ -394,6 +504,12 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             tuple[int, str], PromMetricT
         ] = {}
         self.histogram_fused_store_stage_latency: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_post_ingest_reuse: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_post_promotion_reuse: dict[
             tuple[int, str], PromMetricT
         ] = {}
         self.counter_secondary_tier_task_cpu_seconds: dict[
@@ -511,6 +627,53 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             buckets=latency_buckets[:],
             labelnames=labelnames + ["stage"],
         )
+
+        self._counter_post_ingest_reuse = self._counter_cls(
+            name="vllm:kv_offload_post_ingest_reuse",
+            documentation=(
+                "Logical-key STORE cohorts and subsequent DPU DRAM reuse "
+                "events."
+            ),
+            labelnames=labelnames + ["event"],
+        )
+
+        histogram_ingest_to_first_dram_load = self._histogram_cls(
+            name="vllm:kv_offload_ingest_to_first_dram_load_seconds",
+            documentation=(
+                "Time from successful GPU-to-DPU ingest to the first "
+                "completed request-visible DPU-to-GPU LOAD."
+            ),
+            buckets=latency_buckets[:] + [30, 60, 120, 300, 600],
+            labelnames=labelnames,
+        )
+        self.histogram_ingest_to_first_dram_load = {
+            idx: histogram_ingest_to_first_dram_load.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+
+        self._counter_post_promotion_reuse = self._counter_cls(
+            name="vllm:kv_offload_post_promotion_reuse",
+            documentation=(
+                "Logical-key SSD-to-DPU promotion cohorts and later "
+                "cross-request DPU DRAM reuse events."
+            ),
+            labelnames=labelnames + ["event"],
+        )
+
+        histogram_promotion_to_first_reuse = self._histogram_cls(
+            name="vllm:kv_offload_promotion_to_first_reuse_seconds",
+            documentation=(
+                "Time from successful SSD-to-DPU promotion to the first "
+                "completed request-visible DPU-to-GPU LOAD by a request "
+                "other than the promotion origin."
+            ),
+            buckets=latency_buckets[:] + [30, 60, 120, 300, 600],
+            labelnames=labelnames,
+        )
+        self.histogram_promotion_to_first_reuse = {
+            idx: histogram_promotion_to_first_reuse.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
 
         self._counter_secondary_tier_task_cpu_seconds = self._counter_cls(
             name="vllm:kv_offload_secondary_tier_task_cpu_seconds",
@@ -646,6 +809,12 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 continue
             if transfer_type == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
                 self._observe_fused_store_stage_latency_stats(ops, engine_idx)
+                continue
+            if transfer_type == POST_INGEST_REUSE_STATS_KEY:
+                self._observe_post_ingest_reuse_stats(ops, engine_idx)
+                continue
+            if transfer_type == POST_PROMOTION_REUSE_STATS_KEY:
+                self._observe_post_promotion_reuse_stats(ops, engine_idx)
                 continue
             if transfer_type == RDMA_TRANSPORT_STATS_KEY:
                 self._observe_rdma_transport_stats(ops, engine_idx)
@@ -796,6 +965,56 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.histogram_fused_store_stage_latency[counter_key].observe(
                     latency_s
                 )
+
+    def _observe_post_ingest_reuse_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        counters = stats.get("counters", {})
+        latencies = stats.get("latencies", {})
+        assert isinstance(counters, dict)
+        assert isinstance(latencies, dict)
+        for event, value in counters.items():
+            counter_key = (engine_idx, event)
+            if counter_key not in self.counter_post_ingest_reuse:
+                self.counter_post_ingest_reuse[counter_key] = (
+                    self._counter_post_ingest_reuse.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [event])
+                    )
+                )
+            if value:
+                self.counter_post_ingest_reuse[counter_key].inc(value)
+        first_load_latencies = latencies.get("first_dram_load", [])
+        assert isinstance(first_load_latencies, list)
+        for latency_s in first_load_latencies:
+            self.histogram_ingest_to_first_dram_load[engine_idx].observe(
+                latency_s
+            )
+
+    def _observe_post_promotion_reuse_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        counters = stats.get("counters", {})
+        latencies = stats.get("latencies", {})
+        assert isinstance(counters, dict)
+        assert isinstance(latencies, dict)
+        for event, value in counters.items():
+            counter_key = (engine_idx, event)
+            if counter_key not in self.counter_post_promotion_reuse:
+                self.counter_post_promotion_reuse[counter_key] = (
+                    self._counter_post_promotion_reuse.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [event])
+                    )
+                )
+            if value:
+                self.counter_post_promotion_reuse[counter_key].inc(value)
+        first_reuse_latencies = latencies.get("first_dram_reuse", [])
+        assert isinstance(first_reuse_latencies, list)
+        for latency_s in first_reuse_latencies:
+            self.histogram_promotion_to_first_reuse[engine_idx].observe(
+                latency_s
+            )
 
     def _observe_secondary_tier_task_runtime_stats(
         self, stats: dict[str, Any], engine_idx: int

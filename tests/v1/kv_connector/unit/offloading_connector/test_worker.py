@@ -106,9 +106,68 @@ def _make_worker(kv_cache_config: KVCacheConfig):
     return worker, spec
 
 
+def _make_completion_only_worker():
+    """Build the small worker subset needed to audit completion semantics."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+
+    worker = object.__new__(OffloadingConnectorWorker)
+    worker.worker = MagicMock()
+    worker.kv_connector_stats = MagicMock()
+    worker._load_jobs = {}
+    worker._invalid_load_block_ids = set()
+    worker._unsubmitted_store_jobs = []
+    worker._connector_worker_meta = OffloadingWorkerMetadata()
+    return worker
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_failed_load_reports_completion_failure_and_invalid_gpu_blocks():
+    from vllm.v1.kv_offload.worker.worker import TransferResult
+
+    worker = _make_completion_only_worker()
+    worker._load_jobs[17] = ("request-17", (11, 12, 13))
+    worker.worker.get_finished.return_value = [
+        TransferResult(job_id=17, success=False)
+    ]
+
+    finished_sending, finished_recving = worker.get_finished(set())
+
+    assert finished_sending == set()
+    assert finished_recving == {"request-17"}
+    metadata = worker.build_connector_worker_meta()
+    assert metadata is not None
+    assert metadata.completed_jobs == {17: 1}
+    assert metadata.failed_jobs == {17: 1}
+    assert worker.get_block_ids_with_load_errors() == {11, 12, 13}
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_failed_store_reports_failure_without_invalid_gpu_load_blocks():
+    from vllm.v1.kv_offload.worker.worker import TransferResult
+
+    worker = _make_completion_only_worker()
+    worker.worker.get_finished.return_value = [
+        TransferResult(job_id=23, success=False)
+    ]
+
+    finished_sending, finished_recving = worker.get_finished(set())
+
+    assert finished_sending == set()
+    assert finished_recving == set()
+    metadata = worker.build_connector_worker_meta()
+    assert metadata is not None
+    assert metadata.completed_jobs == {23: 1}
+    assert metadata.failed_jobs == {23: 1}
+    assert worker.get_block_ids_with_load_errors() == set()
 
 
 @pytest.mark.parametrize("backend", ATTN_BACKENDS)

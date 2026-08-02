@@ -30,3 +30,18 @@ def test_aggregate_multiple_workers():
     meta3 = OffloadingWorkerMetadata(completed_jobs={42: 1, 43: 1, 8: 1})
     result = meta1.aggregate(meta2).aggregate(meta3)
     assert result.completed_jobs == {42: 3, 43: 2, 7: 2, 8: 2}
+
+
+def test_aggregate_preserves_failed_rank_count_independently():
+    meta1 = OffloadingWorkerMetadata(
+        completed_jobs={42: 1, 7: 1}, failed_jobs={42: 1}
+    )
+    meta2 = OffloadingWorkerMetadata(completed_jobs={42: 1, 7: 1})
+    meta3 = OffloadingWorkerMetadata(
+        completed_jobs={42: 1, 7: 1}, failed_jobs={7: 1}
+    )
+
+    result = meta1.aggregate(meta2).aggregate(meta3)
+
+    assert result.completed_jobs == {42: 3, 7: 3}
+    assert result.failed_jobs == {42: 1, 7: 1}

@@ -184,6 +184,20 @@ class OffloadingManager(ABC):
         """
         return
 
+    def abort_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Release resources held by a LOAD that completed unsuccessfully.
+
+        Most tiers protect the same source blocks for success and failure, so
+        their rollback is identical to ``complete_load``. Managers that also
+        reserve destination or promotion state can override this hook.
+        """
+
+        self.complete_load(keys, req_context)
+
     @abstractmethod
     def prepare_store(
         self,
