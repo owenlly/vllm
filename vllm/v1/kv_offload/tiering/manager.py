@@ -392,6 +392,13 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> None:
         """Hook invoked after a secondary-to-primary promotion completes."""
 
+    def _on_store_completed(self, job_metadata: JobMetadata) -> None:
+        """Release the Primary source after a Primary-to-Secondary STORE."""
+
+        self.primary_tier.complete_load(
+            job_metadata.keys, job_metadata.req_context
+        )
+
     def _process_finished_jobs(self):
         """
         Unconditionally poll all secondary tiers for completed jobs.
@@ -471,9 +478,7 @@ class TieringOffloadingManager(OffloadingManager):
                     status = "succeeded" if completed_job.success else "failed"
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
-                    self.primary_tier.complete_load(
-                        job_metadata.keys, job_metadata.req_context
-                    )
+                    self._on_store_completed(job_metadata)
                     self._record_secondary_tier_job(
                         operation,
                         status,
