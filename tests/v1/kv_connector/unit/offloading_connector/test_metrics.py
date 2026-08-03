@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    KV_OFFLOAD_SIZE_BUCKETS_BYTES,
     OffloadingConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
@@ -16,6 +17,26 @@ def test_build_kv_connector_stats_with_none():
     assert isinstance(stats, OffloadingConnectorStats)
     assert len(stats.data) == 0
     assert stats.is_empty()
+
+
+def test_kv_offload_size_buckets_cover_full_eight_gib_pool():
+    """The job-size CDF has a finite bound for every supported DPU job."""
+    assert tuple(sorted(set(KV_OFFLOAD_SIZE_BUCKETS_BYTES))) == (
+        KV_OFFLOAD_SIZE_BUCKETS_BYTES
+    )
+    assert KV_OFFLOAD_SIZE_BUCKETS_BYTES[-1] == 8 * 1024**3
+    assert KV_OFFLOAD_SIZE_BUCKETS_BYTES[:10] == (
+        1_000_000,
+        5_000_000,
+        10_000_000,
+        20_000_000,
+        40_000_000,
+        60_000_000,
+        80_000_000,
+        100_000_000,
+        150_000_000,
+        200_000_000,
+    )
 
 
 def test_build_kv_connector_stats_with_empty_dict():

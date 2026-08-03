@@ -58,6 +58,37 @@ RDMA_TRANSPORT_STAT_NAMES = (
     "wr_split",
 )
 
+# Rank-local KV transfer sizes. Keep the historical bounds through 200 MB
+# for comparability, then cover the full tail of the largest DPU pool used by
+# the current experiments. The finite 8 GiB bound lets consumers verify that
+# every job is represented without treating Prometheus's +Inf bucket as a
+# numeric job size.
+KV_OFFLOAD_SIZE_BUCKETS_BYTES = (
+    1_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    40_000_000,
+    60_000_000,
+    80_000_000,
+    100_000_000,
+    150_000_000,
+    200_000_000,
+    250_000_000,
+    300_000_000,
+    400_000_000,
+    500_000_000,
+    600_000_000,
+    800_000_000,
+    1_000_000_000,
+    1_500_000_000,
+    2_000_000_000,
+    3_000_000_000,
+    4_000_000_000,
+    6_000_000_000,
+    8 * 1024**3,
+)
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -612,18 +643,7 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             idx: gauge_primary_cache_usage.labels(*values)
             for idx, values in per_engine_labelvalues.items()
         }
-        buckets = [  # In bytes
-            1e6,
-            5e6,
-            10e6,
-            20e6,
-            40e6,
-            60e6,
-            80e6,
-            100e6,
-            150e6,
-            200e6,
-        ]
+        buckets = list(KV_OFFLOAD_SIZE_BUCKETS_BYTES)
         latency_buckets = [
             0.0005,
             0.001,
