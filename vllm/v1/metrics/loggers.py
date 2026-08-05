@@ -23,6 +23,8 @@ from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
     IterationStats,
+    LMCACHE_MP_TTFT_PHASES,
+    LMCACHE_MP_TAIL_TTFT_PHASES,
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
@@ -803,6 +805,47 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_time_to_first_token, per_engine_labelvalues
         )
 
+        lmcache_mp_latency_buckets = [
+            0.0005,
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            20.0,
+            40.0,
+            80.0,
+            120.0,
+            160.0,
+            240.0,
+            480.0,
+        ]
+        self.histogram_lmcache_mp_ttft_phase = {}
+        for phase in (
+            *LMCACHE_MP_TTFT_PHASES,
+            *LMCACHE_MP_TAIL_TTFT_PHASES,
+        ):
+            histogram = self._histogram_cls(
+                name=f"vllm:lmcache_mp_ttft_{phase}_seconds",
+                documentation=(
+                    "LMCache MP request-level TTFT breakdown: "
+                    f"{phase.replace('_', ' ')}."
+                ),
+                buckets=lmcache_mp_latency_buckets,
+                labelnames=labelnames,
+            )
+            self.histogram_lmcache_mp_ttft_phase[phase] = (
+                create_metric_per_engine(histogram, per_engine_labelvalues)
+            )
+
         histogram_inter_token_latency = self._histogram_cls(
             name="vllm:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
@@ -1196,6 +1239,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_n_request[engine_idx].observe(n_param)
         for ttft in iteration_stats.time_to_first_tokens_iter:
             self.histogram_time_to_first_token[engine_idx].observe(ttft)
+        for phase, latencies in (
+            iteration_stats.lmcache_mp_ttft_latencies_iter.items()
+        ):
+            histogram = self.histogram_lmcache_mp_ttft_phase.get(phase)
+            if histogram is None:
+                continue
+            for latency_s in latencies:
+                histogram[engine_idx].observe(latency_s)
         for itl in iteration_stats.inter_token_latencies_iter:
             self.histogram_inter_token_latency[engine_idx].observe(itl)
 

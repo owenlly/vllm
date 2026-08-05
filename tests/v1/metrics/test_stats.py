@@ -6,12 +6,100 @@ from vllm.v1.metrics.stats import (
     PrefillStats,
     PromptTokenStats,
     RequestStateStats,
+    calculate_lmcache_mp_ttft_breakdown,
 )
 
 
 def test_iteration_stats_repr():
     iteration_stats = IterationStats()
     assert repr(iteration_stats).startswith("IterationStats(")
+
+
+def test_lmcache_mp_ttft_breakdown_closes_external_load_timeline():
+    req_stats = RequestStateStats(
+        queued_ts=10.0,
+        scheduled_ts=25.0,
+        external_lookup_started_ts=12.0,
+        external_lookup_finished_ts=13.0,
+        external_load_gpu_block_wait_started_ts=13.25,
+        external_load_admitted_ts=15.0,
+        external_load_ready_ts=20.0,
+        external_load_revisited_ts=22.0,
+    )
+    prefill_stats = PrefillStats(
+        scheduler_steps=3,
+        model_execution_time=10.0,
+        scheduler_gap_time=4.0,
+    )
+
+    breakdown = calculate_lmcache_mp_ttft_breakdown(
+        req_stats,
+        first_token_ts=40.0,
+        first_token_latency=32.0,
+        prefill_stats=prefill_stats,
+    )
+
+    assert breakdown["external_load_requests"] == 32.0
+    assert breakdown["engine_queue_total"] == 15.0
+    assert breakdown["prefill_total"] == 15.0
+    assert breakdown["frontend_overhead"] == 2.0
+    assert breakdown["queued_before_lookup"] == 2.0
+    assert breakdown["external_lookup"] == 1.0
+    assert breakdown["lookup_to_load_admission"] == 2.0
+    assert breakdown["gpu_block_allocation_wait"] == 1.75
+    assert breakdown["external_load"] == 5.0
+    assert breakdown["scheduler_revisit"] == 2.0
+    assert breakdown["revisit_to_model_schedule"] == 3.0
+    assert breakdown["queue_accounting_error"] == 0.0
+    assert breakdown["prefill_model_execution"] == 10.0
+    assert breakdown["prefill_scheduler_gap"] == 4.0
+    assert breakdown["prefill_accounting_error"] == 1.0
+
+
+def test_lmcache_mp_ttft_breakdown_separates_no_load_requests():
+    req_stats = RequestStateStats(
+        queued_ts=10.0,
+        scheduled_ts=14.0,
+        external_lookup_started_ts=11.0,
+        external_lookup_finished_ts=12.0,
+    )
+
+    breakdown = calculate_lmcache_mp_ttft_breakdown(
+        req_stats,
+        first_token_ts=20.0,
+        first_token_latency=11.0,
+        prefill_stats=PrefillStats(
+            scheduler_steps=1,
+            model_execution_time=6.0,
+        ),
+    )
+
+    assert breakdown["no_external_load_requests"] == 11.0
+    assert "external_load_requests" not in breakdown
+    assert "external_load" not in breakdown
+    assert breakdown["lookup_to_model_schedule"] == 2.0
+    assert breakdown["queue_accounting_error"] == 0.0
+
+
+def test_lmcache_mp_ttft_breakdown_omits_gpu_wait_for_immediate_allocation():
+    req_stats = RequestStateStats(
+        queued_ts=10.0,
+        scheduled_ts=20.0,
+        external_lookup_started_ts=11.0,
+        external_lookup_finished_ts=12.0,
+        external_load_admitted_ts=13.0,
+        external_load_ready_ts=17.0,
+        external_load_revisited_ts=18.0,
+    )
+
+    breakdown = calculate_lmcache_mp_ttft_breakdown(
+        req_stats,
+        first_token_ts=24.0,
+        first_token_latency=15.0,
+        prefill_stats=None,
+    )
+
+    assert "gpu_block_allocation_wait" not in breakdown
 
 
 def test_prefill_kv_computed_with_cache():

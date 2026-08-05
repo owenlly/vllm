@@ -171,6 +171,11 @@ class Request:
         self.num_preemptions = 0
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
+        self._prefill_last_scheduled_ts: float | None = None
+        self._prefill_last_output_ts: float | None = None
+        # Set after the first failed GPU KV-block allocation for an async
+        # external LOAD, so retries record a single wait-start event.
+        self.external_load_gpu_block_wait_started = False
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -301,6 +306,28 @@ class Request:
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
+
+    def record_prefill_scheduled(self, timestamp: float) -> None:
+        """Record one model-runner step before the request's first token."""
+        stats = self.prefill_stats
+        if stats is None:
+            return
+        if self._prefill_last_output_ts is not None:
+            stats.scheduler_gap_time += max(
+                timestamp - self._prefill_last_output_ts, 0.0
+            )
+        stats.scheduler_steps += 1
+        self._prefill_last_scheduled_ts = timestamp
+
+    def record_prefill_output(self, timestamp: float) -> None:
+        """Record completion of the latest prefill model-runner step."""
+        stats = self.prefill_stats
+        scheduled_ts = self._prefill_last_scheduled_ts
+        if stats is None or scheduled_ts is None:
+            return
+        stats.model_execution_time += max(timestamp - scheduled_ts, 0.0)
+        self._prefill_last_scheduled_ts = None
+        self._prefill_last_output_ts = timestamp
 
     def __lt__(self, other: "Request") -> bool:
         """

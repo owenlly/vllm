@@ -793,6 +793,11 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     if load_kv_async and self.connector is not None:
+                        if not request.external_load_gpu_block_wait_started:
+                            request.external_load_gpu_block_wait_started = True
+                            request.record_event(
+                                EngineCoreEventType.EXTERNAL_LOAD_GPU_BLOCK_WAIT_STARTED
+                            )
                         self.connector.on_external_load_allocation_failure(request)
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -900,6 +905,11 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
+
+        for request_id in num_scheduled_tokens:
+            request = self.requests.get(request_id)
+            if request is not None:
+                request.record_prefill_scheduled(scheduled_timestamp)
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -1414,6 +1424,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        model_output_timestamp = time.monotonic()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1429,6 +1440,8 @@ class Scheduler(SchedulerInterface):
                 # be set to None (in order to finish async KV transfer).
                 # In this case, we use is_finished() to check.
                 continue
+
+            request.record_prefill_output(model_output_timestamp)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -2219,6 +2232,7 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            request.record_event(EngineCoreEventType.EXTERNAL_LOAD_REVISITED)
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED

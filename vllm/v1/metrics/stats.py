@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -213,11 +214,177 @@ class RequestStateStats:
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
 
+    # LMCache MP request stages. These are EngineCore monotonic timestamps.
+    external_lookup_started_ts: float = 0.0
+    external_lookup_finished_ts: float = 0.0
+    external_load_gpu_block_wait_started_ts: float = 0.0
+    external_load_admitted_ts: float = 0.0
+    external_load_ready_ts: float = 0.0
+    external_load_revisited_ts: float = 0.0
+
     # first token latency
     first_token_latency: float = 0.0
 
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
+
+
+LMCACHE_MP_TTFT_PHASES: tuple[str, ...] = (
+    "external_load_requests",
+    "no_external_load_requests",
+    "engine_queue_total",
+    "prefill_total",
+    "frontend_overhead",
+    "queued_before_lookup",
+    "external_lookup",
+    "lookup_to_load_admission",
+    "gpu_block_allocation_wait",
+    "lookup_to_model_schedule",
+    "external_load",
+    "scheduler_revisit",
+    "revisit_to_model_schedule",
+    "prefill_model_execution",
+    "prefill_scheduler_gap",
+    "queue_accounting_error",
+    "prefill_accounting_error",
+)
+
+# Keep a separate distribution for the requests users actually perceive as
+# tail outliers.  Recording this at first-token time preserves phase
+# correlation: every ``tail_*`` histogram contains only phases from requests
+# whose complete TTFT crossed the same threshold.
+LMCACHE_MP_TAIL_TTFT_THRESHOLD_SECONDS = max(
+    float(os.getenv("VLLM_LMCACHE_MP_TAIL_TTFT_THRESHOLD_S", "60")),
+    0.0,
+)
+LMCACHE_MP_TAIL_TTFT_PHASES: tuple[str, ...] = tuple(
+    f"tail_{phase}" for phase in LMCACHE_MP_TTFT_PHASES
+)
+
+
+def _interval(start: float, end: float) -> float | None:
+    if start <= 0.0 or end < start:
+        return None
+    return end - start
+
+
+def calculate_lmcache_mp_ttft_breakdown(
+    req_stats: RequestStateStats,
+    first_token_ts: float,
+    first_token_latency: float,
+    prefill_stats: "PrefillStats | None",
+) -> dict[str, float]:
+    """Close an LMCache MP request timeline against its observed TTFT."""
+    if req_stats.external_lookup_started_ts <= 0.0:
+        return {}
+
+    values: dict[str, float] = {}
+    has_external_load = req_stats.external_load_admitted_ts > 0.0
+    cohort = (
+        "external_load_requests"
+        if has_external_load
+        else "no_external_load_requests"
+    )
+    values[cohort] = max(first_token_latency, 0.0)
+
+    queue_total = _interval(req_stats.queued_ts, req_stats.scheduled_ts)
+    prefill_total = _interval(req_stats.scheduled_ts, first_token_ts)
+    if queue_total is not None:
+        values["engine_queue_total"] = queue_total
+    if prefill_total is not None:
+        values["prefill_total"] = prefill_total
+    if queue_total is not None and prefill_total is not None:
+        values["frontend_overhead"] = max(
+            first_token_latency - queue_total - prefill_total, 0.0
+        )
+
+    phase_boundaries = {
+        "queued_before_lookup": (
+            req_stats.queued_ts,
+            req_stats.external_lookup_started_ts,
+        ),
+        "external_lookup": (
+            req_stats.external_lookup_started_ts,
+            req_stats.external_lookup_finished_ts,
+        ),
+        "lookup_to_load_admission": (
+            req_stats.external_lookup_finished_ts,
+            req_stats.external_load_admitted_ts,
+        ),
+        "external_load": (
+            req_stats.external_load_admitted_ts,
+            req_stats.external_load_ready_ts,
+        ),
+        "scheduler_revisit": (
+            req_stats.external_load_ready_ts,
+            req_stats.external_load_revisited_ts,
+        ),
+        "revisit_to_model_schedule": (
+            req_stats.external_load_revisited_ts,
+            req_stats.scheduled_ts,
+        ),
+    }
+    for name, (start, end) in phase_boundaries.items():
+        duration = _interval(start, end)
+        if duration is not None:
+            values[name] = duration
+
+    # This is a nested diagnostic within lookup_to_load_admission, recorded
+    # only for requests whose first GPU KV-block allocation actually failed.
+    # Do not add it to queue_phase_names below or it would be double-counted.
+    gpu_block_wait = _interval(
+        req_stats.external_load_gpu_block_wait_started_ts,
+        req_stats.external_load_admitted_ts,
+    )
+    if gpu_block_wait is not None:
+        values["gpu_block_allocation_wait"] = gpu_block_wait
+
+    if not has_external_load:
+        duration = _interval(
+            req_stats.external_lookup_finished_ts,
+            req_stats.scheduled_ts,
+        )
+        if duration is not None:
+            values["lookup_to_model_schedule"] = duration
+
+    queue_phase_names = (
+        (
+            "queued_before_lookup",
+            "external_lookup",
+            "lookup_to_load_admission",
+            "external_load",
+            "scheduler_revisit",
+            "revisit_to_model_schedule",
+        )
+        if has_external_load
+        else (
+            "queued_before_lookup",
+            "external_lookup",
+            "lookup_to_model_schedule",
+        )
+    )
+    if queue_total is not None and all(
+        name in values for name in queue_phase_names
+    ):
+        values["queue_accounting_error"] = abs(
+            queue_total - sum(values[name] for name in queue_phase_names)
+        )
+
+    if prefill_stats is not None and prefill_stats.scheduler_steps > 0:
+        values["prefill_model_execution"] = max(
+            prefill_stats.model_execution_time, 0.0
+        )
+        values["prefill_scheduler_gap"] = max(
+            prefill_stats.scheduler_gap_time, 0.0
+        )
+        if prefill_total is not None:
+            values["prefill_accounting_error"] = abs(
+                prefill_total
+                - prefill_stats.model_execution_time
+                - prefill_stats.scheduler_gap_time
+            )
+
+    return values
 
 
 @dataclass
@@ -253,6 +420,12 @@ class PrefillStats:
             external lookup attempt. This remains stable across scheduler retries.
         external_lookup_cached_tokens: Full prefix reported by the external
             cache, including tokens that overlap the initial local prefix.
+        scheduler_steps: Number of model-runner steps used before the first
+            token was produced.
+        model_execution_time: Sum of schedule-to-model-output wall time over
+            those prefill steps.
+        scheduler_gap_time: Sum of model-output-to-next-schedule gaps between
+            prefill steps.
     """
 
     num_prompt_tokens: int = 0
@@ -268,6 +441,9 @@ class PrefillStats:
     corrected_computed_tokens: int = 0
     external_load_tokens: int = 0
     cache_attribution_available: bool = False
+    scheduler_steps: int = 0
+    model_execution_time: float = 0.0
+    scheduler_gap_time: float = 0.0
 
     def observe_initial_local_cache_hit(self, num_tokens: int) -> None:
         """Capture the first local-cache lookup without overwriting retries."""
@@ -438,6 +614,9 @@ class IterationStats:
         self.n_params_iter: list[int] = []
         self.time_to_first_tokens_iter: list[float] = []
         self.inter_token_latencies_iter: list[float] = []
+        self.lmcache_mp_ttft_latencies_iter: dict[str, list[float]] = (
+            defaultdict(list)
+        )
         self.num_corrupted_reqs: int = 0
 
     def __repr__(self) -> str:
@@ -495,6 +674,25 @@ class IterationStats:
                 lora_name,
             )
 
+        if is_prefilling:
+            breakdown = calculate_lmcache_mp_ttft_breakdown(
+                req_stats,
+                engine_core_timestamp,
+                first_token_latency,
+                output.prefill_stats,
+            )
+            for name, latency_s in breakdown.items():
+                self.lmcache_mp_ttft_latencies_iter[name].append(latency_s)
+            if (
+                breakdown
+                and first_token_latency
+                >= LMCACHE_MP_TAIL_TTFT_THRESHOLD_SECONDS
+            ):
+                for name, latency_s in breakdown.items():
+                    self.lmcache_mp_ttft_latencies_iter[
+                        f"tail_{name}"
+                    ].append(latency_s)
+
         # Process the batch-level "new tokens" engine core event
         if is_prefilling:
             req_stats.first_token_ts = engine_core_timestamp
@@ -527,6 +725,29 @@ class IterationStats:
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)
+            elif event.type == EngineCoreEventType.EXTERNAL_LOOKUP_STARTED:
+                if req_stats.external_lookup_started_ts == 0.0:
+                    req_stats.external_lookup_started_ts = event.timestamp
+            elif event.type == EngineCoreEventType.EXTERNAL_LOOKUP_FINISHED:
+                if req_stats.external_lookup_finished_ts == 0.0:
+                    req_stats.external_lookup_finished_ts = event.timestamp
+            elif (
+                event.type
+                == EngineCoreEventType.EXTERNAL_LOAD_GPU_BLOCK_WAIT_STARTED
+            ):
+                if req_stats.external_load_gpu_block_wait_started_ts == 0.0:
+                    req_stats.external_load_gpu_block_wait_started_ts = (
+                        event.timestamp
+                    )
+            elif event.type == EngineCoreEventType.EXTERNAL_LOAD_ADMITTED:
+                if req_stats.external_load_admitted_ts == 0.0:
+                    req_stats.external_load_admitted_ts = event.timestamp
+            elif event.type == EngineCoreEventType.EXTERNAL_LOAD_READY:
+                if req_stats.external_load_ready_ts == 0.0:
+                    req_stats.external_load_ready_ts = event.timestamp
+            elif event.type == EngineCoreEventType.EXTERNAL_LOAD_REVISITED:
+                if req_stats.external_load_revisited_ts == 0.0:
+                    req_stats.external_load_revisited_ts = event.timestamp
 
     def update_from_finished_request(
         self,
