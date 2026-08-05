@@ -26,7 +26,7 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -4532,6 +4532,15 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.request_id not in req_to_blocks
     assert len(scheduler.running) == 0
+    assert any(
+        event.type == EngineCoreEventType.EXTERNAL_LOAD_ADMITTED
+        for event in a.events
+    )
+    assert any(
+        event.type
+        == EngineCoreEventType.EXTERNAL_LOAD_GPU_BLOCK_WAIT_STARTED
+        for event in b.events
+    )
     scheduler.update_from_output(out1, EMPTY_OUTPUT)
 
     # Step 2: nothing changes until A's recv lands.

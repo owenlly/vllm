@@ -806,6 +806,17 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
+                # Close the async external-LOAD admission interval at the
+                # successful GPU KV-block allocation.  A request that first
+                # failed allocation records EXTERNAL_LOAD_GPU_BLOCK_WAIT_STARTED
+                # above; stats.py uses this event as the matching end point for
+                # gpu_block_allocation_wait.  Record it before connector state
+                # updates so the metric excludes LOAD setup and transport time.
+                if load_kv_async and self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.EXTERNAL_LOAD_ADMITTED
+                    )
+
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
                 # This information is used to determine if a load is

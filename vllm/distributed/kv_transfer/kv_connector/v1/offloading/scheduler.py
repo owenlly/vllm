@@ -204,6 +204,9 @@ class RequestOffloadState:
     external_ready_observed_at_s: float | None = None
     gpu_allocation_first_failed_at_s: float | None = None
     gpu_allocation_completed_at_s: float | None = None
+    # Prevent the allocation-wait sample from being emitted twice when the
+    # scheduler-revisit breakdown is also enabled.
+    gpu_allocation_wait_recorded: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -434,6 +437,8 @@ class OffloadingConnectorScheduler:
             if req_status is not None
             else None
         )
+        if req_status is not None:
+            self._record_gpu_block_allocation_wait(req_status)
         ready_detection_wait_s = (
             max(
                 min(ready_observed_at_s, prepare_load_started_at_s) - ready_at_s,
@@ -511,7 +516,6 @@ class OffloadingConnectorScheduler:
             iteration_to_waiting_phase_s
         )
         stats["scheduler_waiting_queue_scan"].append(waiting_queue_scan_s)
-        stats["scheduler_gpu_block_wait"].append(gpu_block_wait_s)
         stats["scheduler_alloc_to_prepare_load"].append(
             allocation_to_prepare_wait_s
         )
@@ -544,6 +548,29 @@ class OffloadingConnectorScheduler:
             ].append(
                 max(completed_at_s - job_status.external_load_started_at_s, 0.0)
             )
+
+    def _record_gpu_block_allocation_wait(
+        self, req_status: RequestOffloadState
+    ) -> None:
+        """Record the request's actual GPU-block allocation wait once.
+
+        This interval is independent of the connector's promotion timing.
+        Fused DPU LOADs can complete through a DPU-specific path without
+        exposing a standard promotion timestamp, but they still use the
+        common scheduler allocation failure/success boundary.
+        """
+        if not getattr(self, "_profile_job_breakdown", True):
+            return
+        if getattr(req_status, "gpu_allocation_wait_recorded", False):
+            return
+        failed_at_s = req_status.gpu_allocation_first_failed_at_s
+        completed_at_s = req_status.gpu_allocation_completed_at_s
+        if failed_at_s is None or completed_at_s is None:
+            return
+        self._external_load_stage_latency_stats[
+            "scheduler_gpu_block_wait"
+        ].append(max(completed_at_s - failed_at_s, 0.0))
+        req_status.gpu_allocation_wait_recorded = True
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
@@ -809,7 +836,7 @@ class OffloadingConnectorScheduler:
         return num_hit_tokens, bool(num_hit_tokens)
 
     def on_external_load_allocation_failure(self, request: Request) -> None:
-        if not getattr(self, "_profile_scheduler_revisit", False):
+        if not getattr(self, "_profile_job_breakdown", True):
             return
         req_status = self._req_status.get(request.request_id)
         if (
@@ -837,10 +864,11 @@ class OffloadingConnectorScheduler:
 
         req_status = self._req_status[request.request_id]
         if (
-            getattr(self, "_profile_scheduler_revisit", False)
+            getattr(self, "_profile_job_breakdown", True)
             and req_status.gpu_allocation_completed_at_s is None
         ):
             req_status.gpu_allocation_completed_at_s = time.monotonic()
+            self._record_gpu_block_allocation_wait(req_status)
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens

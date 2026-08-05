@@ -254,6 +254,44 @@ def test_external_load_allocation_failure_records_first_failure_only():
     assert req_status.gpu_allocation_first_failed_at_s == 3.0
 
 
+def test_external_load_allocation_failure_is_tracked_by_job_breakdown():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = False
+    req_status = SimpleNamespace(gpu_allocation_first_failed_at_s=None)
+    scheduler._req_status = {"request": req_status}
+    request = SimpleNamespace(request_id="request")
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading."
+        "scheduler.time.monotonic",
+        return_value=3.0,
+    ):
+        scheduler.on_external_load_allocation_failure(request)
+
+    assert req_status.gpu_allocation_first_failed_at_s == 3.0
+
+
+def test_gpu_block_allocation_wait_is_recorded_without_revisit_timing():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._profile_job_breakdown = True
+    scheduler._profile_scheduler_revisit = False
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+    req_status = SimpleNamespace(
+        gpu_allocation_first_failed_at_s=3.0,
+        gpu_allocation_completed_at_s=4.25,
+        gpu_allocation_wait_recorded=False,
+    )
+
+    scheduler._record_gpu_block_allocation_wait(req_status)
+    scheduler._record_gpu_block_allocation_wait(req_status)
+
+    assert scheduler._external_load_stage_latency_stats == {
+        "scheduler_gpu_block_wait": [1.25]
+    }
+    assert req_status.gpu_allocation_wait_recorded is True
+
+
 def test_scheduler_phase_timestamps_follow_current_iteration():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler._profile_job_breakdown = True

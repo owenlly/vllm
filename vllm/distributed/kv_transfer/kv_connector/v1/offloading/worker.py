@@ -310,6 +310,15 @@ class OffloadingConnectorWorker:
                         )
                     }
                 )
+            if transfer_result.fused_store_stage_latencies:
+                self.kv_connector_stats.record_fused_store_stage_latency_stats(
+                    {
+                        stage: [latency_s]
+                        for stage, latency_s in (
+                            transfer_result.fused_store_stage_latencies.items()
+                        )
+                    }
+                )
 
             self._connector_worker_meta.mark_completed(job_id)
             if not transfer_result.success:
