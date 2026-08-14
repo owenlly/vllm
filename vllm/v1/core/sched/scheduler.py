@@ -580,7 +580,9 @@ class Scheduler(SchedulerInterface):
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
+                ) and not self._try_promote_blocked_waiting_request(
+                    request, scheduled_timestamp
+                ):
                     if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
@@ -625,6 +627,9 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        self._record_external_lookup_started(
+                            request, scheduled_timestamp
+                        )
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -638,6 +643,10 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+
+                        self._record_external_lookup_finished(
+                            request, scheduled_timestamp
+                        )
 
                         num_external_computed_tokens = ext_tokens
                         num_external_lookup_cached_tokens = (
@@ -2233,7 +2242,9 @@ class Scheduler(SchedulerInterface):
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
-    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
+    def _try_promote_blocked_waiting_request(
+        self, request: Request, scheduled_timestamp: float
+    ) -> bool:
         """
         Try to promote a blocked waiting request back to schedulable states.
         """
@@ -2243,7 +2254,10 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
-            request.record_event(EngineCoreEventType.EXTERNAL_LOAD_REVISITED)
+            request.record_event(
+                EngineCoreEventType.EXTERNAL_LOAD_REVISITED,
+                scheduled_timestamp,
+            )
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
@@ -2266,6 +2280,26 @@ class Scheduler(SchedulerInterface):
             "Unexpected blocked waiting status in promotion: "
             f"{request.status.name} for request {request.request_id}"
         )
+
+    def _record_external_lookup_started(
+        self, request: Request, scheduled_timestamp: float
+    ) -> None:
+        if self.log_stats and not request.external_lookup_started_recorded:
+            request.record_event(
+                EngineCoreEventType.EXTERNAL_LOOKUP_STARTED,
+                scheduled_timestamp,
+            )
+            request.external_lookup_started_recorded = True
+
+    def _record_external_lookup_finished(
+        self, request: Request, scheduled_timestamp: float
+    ) -> None:
+        if self.log_stats and not request.external_lookup_finished_recorded:
+            request.record_event(
+                EngineCoreEventType.EXTERNAL_LOOKUP_FINISHED,
+                scheduled_timestamp,
+            )
+            request.external_lookup_finished_recorded = True
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """

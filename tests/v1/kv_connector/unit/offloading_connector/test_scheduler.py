@@ -3,7 +3,7 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -14,11 +14,16 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingWorkerMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     TransferJobStatus,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -32,6 +37,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     get_offload_block_hash,
 )
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 
@@ -366,6 +372,156 @@ def test_external_load_stage_latency_can_be_disabled():
 
     monotonic.assert_not_called()
     assert scheduler._external_load_stage_latency_stats == {}
+
+
+def test_external_load_gpu_block_tracking_records_job_and_concurrency_peaks():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._external_load_job_gpu_block_counts = []
+    scheduler._external_load_inflight_gpu_blocks = 0
+    scheduler._external_load_peak_inflight_gpu_blocks = 0
+    scheduler._external_load_max_job_gpu_blocks = 0
+    scheduler._external_load_inflight_jobs = 0
+    scheduler._external_load_peak_inflight_jobs = 0
+
+    scheduler._start_external_load_gpu_block_tracking(128)
+    scheduler._start_external_load_gpu_block_tracking(512)
+    scheduler._finish_external_load_gpu_block_tracking(128)
+
+    assert scheduler._external_load_job_gpu_block_counts == [128, 512]
+    assert scheduler._external_load_inflight_gpu_blocks == 512
+    assert scheduler._external_load_peak_inflight_gpu_blocks == 640
+    assert scheduler._external_load_max_job_gpu_blocks == 512
+    assert scheduler._external_load_inflight_jobs == 1
+    assert scheduler._external_load_peak_inflight_jobs == 2
+
+    scheduler._finish_external_load_gpu_block_tracking(512)
+    assert scheduler._external_load_inflight_gpu_blocks == 0
+    assert scheduler._external_load_inflight_jobs == 0
+
+
+def test_external_lookup_events_use_request_queue_iteration_boundaries():
+    scheduler = object.__new__(Scheduler)
+    scheduler.log_stats = True
+    request = SimpleNamespace(
+        external_lookup_started_recorded=False,
+        external_lookup_finished_recorded=False,
+        record_event=MagicMock(),
+    )
+
+    scheduler._record_external_lookup_started(request, 10.0)
+    scheduler._record_external_lookup_started(request, 11.0)
+    scheduler._record_external_lookup_finished(request, 12.0)
+    scheduler._record_external_lookup_finished(request, 13.0)
+
+    assert request.record_event.call_args_list == [
+        call(EngineCoreEventType.EXTERNAL_LOOKUP_STARTED, 10.0),
+        call(EngineCoreEventType.EXTERNAL_LOOKUP_FINISHED, 12.0),
+    ]
+
+
+def test_external_load_revisit_uses_request_queue_schedule_boundary():
+    scheduler = object.__new__(Scheduler)
+    scheduler.finished_recving_kv_req_ids = {"request-0"}
+    scheduler._update_waiting_for_remote_kv = MagicMock()
+    request = SimpleNamespace(
+        request_id="request-0",
+        status=RequestStatus.WAITING_FOR_REMOTE_KVS,
+        num_preemptions=0,
+        record_event=MagicMock(),
+    )
+    scheduled_timestamp = 123.5
+
+    assert scheduler._try_promote_blocked_waiting_request(
+        request, scheduled_timestamp
+    )
+
+    scheduler._update_waiting_for_remote_kv.assert_called_once_with(request)
+    request.record_event.assert_called_once_with(
+        EngineCoreEventType.EXTERNAL_LOAD_REVISITED,
+        scheduled_timestamp,
+    )
+    assert request.status == RequestStatus.WAITING
+
+
+def test_external_load_completion_records_ready_exactly_once():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    request = MagicMock()
+    request.is_finished.return_value = False
+    req_status = SimpleNamespace(
+        req=request,
+        req_context=MagicMock(),
+        transfer_jobs={7},
+        external_load_ready_recorded=False,
+    )
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {
+        7: TransferJobStatus(
+            req_id="request-0",
+            pending_count=1,
+            keys=set(),
+            is_store=False,
+            load_gpu_block_count=32,
+        )
+    }
+    scheduler._req_status = {"request-0": req_status}
+    scheduler.manager = MagicMock()
+    scheduler._record_load_gpu_ready = MagicMock()
+    scheduler._blocks_being_loaded = set()
+    scheduler._block_id_to_pending_jobs = {}
+    scheduler._finish_external_load_gpu_block_tracking = MagicMock()
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 1}
+            )
+        )
+    )
+
+    request.record_event.assert_called_once_with(
+        EngineCoreEventType.EXTERNAL_LOAD_READY
+    )
+    scheduler._finish_external_load_gpu_block_tracking.assert_called_once_with(
+        32
+    )
+
+
+def test_external_lookup_defers_while_request_transfer_jobs_are_pending():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    request = SimpleNamespace(request_id="request-0")
+    scheduler._req_status = {
+        request.request_id: SimpleNamespace(transfer_jobs={3, 7})
+    }
+    scheduler._lookup = MagicMock()
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    scheduler._lookup.assert_not_called()
+
+
+def test_external_load_gpu_block_stats_are_exported_and_samples_drained():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace()
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+    scheduler._external_load_job_gpu_block_counts = [128, 512]
+    scheduler._external_load_inflight_gpu_blocks = 512
+    scheduler._external_load_peak_inflight_gpu_blocks = 640
+    scheduler._external_load_max_job_gpu_blocks = 512
+    scheduler._external_load_inflight_jobs = 1
+    scheduler._external_load_peak_inflight_jobs = 2
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "external_load_gpu_block_job_count": 2,
+        "external_load_gpu_block_job_sum": 640,
+        "external_load_gpu_block_current_inflight_gpu_blocks": 512,
+        "external_load_gpu_block_peak_inflight_gpu_blocks": 640,
+        "external_load_gpu_block_max_job_gpu_blocks": 512,
+        "external_load_gpu_block_current_inflight_jobs": 1,
+        "external_load_gpu_block_peak_inflight_jobs": 2,
+    }
+    assert scheduler._external_load_job_gpu_block_counts == []
 
 
 def test_external_load_host_latency_stats_are_exported():

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
+
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    EXTERNAL_LOAD_GPU_BLOCK_BUCKETS,
     KV_OFFLOAD_SIZE_BUCKETS_BYTES,
     OffloadingConnectorStats,
 )
@@ -37,6 +40,68 @@ def test_kv_offload_size_buckets_cover_full_eight_gib_pool():
         150_000_000,
         200_000_000,
     )
+
+
+def test_external_load_gpu_block_buckets_cover_large_jobs():
+    assert tuple(sorted(set(EXTERNAL_LOAD_GPU_BLOCK_BUCKETS))) == (
+        EXTERNAL_LOAD_GPU_BLOCK_BUCKETS
+    )
+    assert EXTERNAL_LOAD_GPU_BLOCK_BUCKETS[0] == 1
+    assert EXTERNAL_LOAD_GPU_BLOCK_BUCKETS[-1] == 16384
+
+
+def test_aggregate_external_load_gpu_block_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_external_load_gpu_block_stats(
+        {
+            "job_gpu_blocks": [8, 128],
+            "current_inflight_gpu_blocks": 128,
+            "peak_inflight_gpu_blocks": 256,
+            "max_job_gpu_blocks": 128,
+            "current_inflight_jobs": 1,
+            "peak_inflight_jobs": 3,
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_external_load_gpu_block_stats(
+        {
+            "job_gpu_blocks": [64, 512],
+            "current_inflight_gpu_blocks": 0,
+            "peak_inflight_gpu_blocks": 640,
+            "max_job_gpu_blocks": 512,
+            "current_inflight_jobs": 0,
+            "peak_inflight_jobs": 4,
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced == {
+        "external_load_gpu_block_job_count": 4,
+        "external_load_gpu_block_job_sum": 712,
+        "external_load_gpu_block_current_inflight_gpu_blocks": 0,
+        "external_load_gpu_block_peak_inflight_gpu_blocks": 640,
+        "external_load_gpu_block_max_job_gpu_blocks": 512,
+        "external_load_gpu_block_current_inflight_jobs": 0,
+        "external_load_gpu_block_peak_inflight_jobs": 4,
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_stats",
+    [
+        {"job_gpu_blocks": [-1]},
+        {"job_gpu_blocks": [1.5]},
+        {"job_gpu_blocks": "8"},
+        {"current_inflight_gpu_blocks": -1},
+        {"unknown": 1},
+    ],
+)
+def test_external_load_gpu_block_stats_reject_invalid_values(bad_stats):
+    with pytest.raises(ValueError):
+        OffloadingConnectorStats().record_external_load_gpu_block_stats(
+            bad_stats
+        )
 
 
 def test_build_kv_connector_stats_with_empty_dict():
@@ -324,6 +389,36 @@ def test_aggregate_external_load_stage_latency_stats():
     )
 
 
+def test_aggregate_dpu_lookup_stage_latency_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_dpu_lookup_stage_latency_stats(
+        {
+            "request_first_lookup_to_dispatch": [0.01],
+            "rank0_bf3_service": [0.00002],
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_dpu_lookup_stage_latency_stats(
+        {
+            "request_first_lookup_to_dispatch": [0.02],
+            "rank0_bf3_service": [0.00003],
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced[
+        "dpu_lookup_request_first_lookup_to_dispatch_latency_count"
+    ] == 2
+    assert reduced[
+        "dpu_lookup_request_first_lookup_to_dispatch_latency_sum"
+    ] == pytest.approx(0.03)
+    assert reduced["dpu_lookup_rank0_bf3_service_latency_count"] == 2
+    assert reduced["dpu_lookup_rank0_bf3_service_latency_sum"] == pytest.approx(
+        0.00005
+    )
+
+
 def test_aggregate_fused_store_stage_latency_stats():
     """Fused STORE stage samples are preserved across observations."""
     stats1 = OffloadingConnectorStats()
@@ -407,6 +502,40 @@ def test_aggregate_fused_store_stage_latency_stats():
         )
         < 1e-12
     )
+
+
+def test_aggregate_fused_store_dpu_dedup_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_fused_store_dedup_stats(
+        {
+            "candidate_entries": 10,
+            "present_skipped_entries": 4,
+            "writing_skipped_entries": 2,
+            "transferred_entries": 4,
+            "work_requests": 3,
+            "bytes": 48 << 20,
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_fused_store_dedup_stats(
+        {
+            "candidate_entries": 5,
+            "present_skipped_entries": 1,
+            "writing_skipped_entries": 1,
+            "transferred_entries": 3,
+            "work_requests": 2,
+            "bytes": 36 << 20,
+        }
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["fused_store_dedup_candidate_entries"] == 15
+    assert reduced["fused_store_dedup_present_skipped_entries"] == 5
+    assert reduced["fused_store_dedup_writing_skipped_entries"] == 3
+    assert reduced["fused_store_dedup_transferred_entries"] == 7
+    assert reduced["fused_store_dedup_work_requests"] == 5
+    assert reduced["fused_store_dedup_bytes"] == 84 << 20
 
 
 def test_aggregate_fused_load_stage_latency_stats():

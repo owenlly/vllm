@@ -28,6 +28,7 @@ class TransferResult:
     fused_load_stage_latencies: dict[str, float] | None = None
     # Optional connector-specific fused STORE stages, parallel to fused LOAD.
     fused_store_stage_latencies: dict[str, float] | None = None
+    fused_store_dedup_stats: dict[str, int] | None = None
 
 
 class OffloadingHandler(ABC):

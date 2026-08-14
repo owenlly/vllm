@@ -319,6 +319,10 @@ class OffloadingConnectorWorker:
                         )
                     }
                 )
+            if transfer_result.fused_store_dedup_stats:
+                self.kv_connector_stats.record_fused_store_dedup_stats(
+                    transfer_result.fused_store_dedup_stats
+                )
 
             self._connector_worker_meta.mark_completed(job_id)
             if not transfer_result.success:

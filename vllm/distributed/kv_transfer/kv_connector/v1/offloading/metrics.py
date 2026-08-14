@@ -20,10 +20,28 @@ SECONDARY_TIER_STATS_KEY = "secondary_tier_stats"
 SECONDARY_TIER_JOB_LATENCY_STATS_KEY = "secondary_tier_job_latency_stats"
 SECONDARY_TIER_TASK_RUNTIME_STATS_KEY = "secondary_tier_task_runtime_stats"
 TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
+DPU_LOOKUP_STAGE_LATENCY_STATS_KEY = "dpu_lookup_stage_latency_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
+EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY = "external_load_gpu_block_stats"
+EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES = (
+    "current_inflight_gpu_blocks",
+    "peak_inflight_gpu_blocks",
+    "max_job_gpu_blocks",
+    "current_inflight_jobs",
+    "peak_inflight_jobs",
+)
 FUSED_LOAD_STAGE_LATENCY_STATS_KEY = "fused_load_stage_latency_stats"
 FUSED_STORE_STAGE_LATENCY_STATS_KEY = "fused_store_stage_latency_stats"
+FUSED_STORE_DEDUP_STATS_KEY = "fused_store_dedup_stats"
+FUSED_STORE_DEDUP_STAT_NAMES = (
+    "candidate_entries",
+    "present_skipped_entries",
+    "writing_skipped_entries",
+    "transferred_entries",
+    "work_requests",
+    "bytes",
+)
 POST_STORE_PRIMARY_READY_REUSE_STATS_KEY = "post_store_primary_ready_reuse_stats"
 POST_STORE_PRIMARY_READY_REUSE_COUNTER_NAMES = (
     "cohort_keys",
@@ -89,6 +107,24 @@ KV_OFFLOAD_SIZE_BUCKETS_BYTES = (
     8 * 1024**3,
 )
 
+EXTERNAL_LOAD_GPU_BLOCK_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+)
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -124,17 +160,26 @@ class OffloadingConnectorStats(KVConnectorStats):
                 if k == TIERING_LOOKUP_STATS_KEY:
                     self._aggregate_tiering_lookup_stats(v)
                     continue
+                if k == DPU_LOOKUP_STAGE_LATENCY_STATS_KEY:
+                    self._aggregate_dpu_lookup_stage_latency_stats(v)
+                    continue
                 if k == PRIMARY_EVICTION_STATS_KEY:
                     self._aggregate_primary_eviction_stats(v)
                     continue
                 if k == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_external_load_stage_latency_stats(v)
                     continue
+                if k == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
+                    self._aggregate_external_load_gpu_block_stats(v)
+                    continue
                 if k == FUSED_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_fused_load_stage_latency_stats(v)
                     continue
                 if k == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_fused_store_stage_latency_stats(v)
+                    continue
+                if k == FUSED_STORE_DEDUP_STATS_KEY:
+                    self._aggregate_fused_store_dedup_stats(v)
                     continue
                 if k == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                     self._aggregate_reuse_stats(k, v)
@@ -209,6 +254,18 @@ class OffloadingConnectorStats(KVConnectorStats):
         for name, value in stats.items():
             accumulator[name] = accumulator.get(name, 0) + value
 
+    def _aggregate_dpu_lookup_stage_latency_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        accumulator = self.data.setdefault(
+            DPU_LOOKUP_STAGE_LATENCY_STATS_KEY, {}
+        )
+        assert isinstance(accumulator, dict)
+        for stage, latencies in stats.items():
+            output_latencies = accumulator.setdefault(stage, [])
+            assert isinstance(output_latencies, list)
+            output_latencies.extend(latencies)
+
     def _aggregate_primary_eviction_stats(self, stats: dict[str, Any]) -> None:
         accumulator = self.data.setdefault(PRIMARY_EVICTION_STATS_KEY, {})
         assert isinstance(accumulator, dict)
@@ -231,6 +288,43 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
 
+    def _aggregate_external_load_gpu_block_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        allowed_names = {
+            "job_gpu_blocks",
+            *EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES,
+        }
+        if set(stats) - allowed_names:
+            raise ValueError("unknown external LOAD GPU block statistic")
+
+        job_gpu_blocks = stats.get("job_gpu_blocks", [])
+        if not isinstance(job_gpu_blocks, list) or any(
+            not isinstance(value, int) or value < 0
+            for value in job_gpu_blocks
+        ):
+            raise ValueError("invalid external LOAD job GPU block samples")
+
+        accumulator = self.data.setdefault(
+            EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY,
+            {"job_gpu_blocks": []},
+        )
+        assert isinstance(accumulator, dict)
+        output_samples = accumulator.setdefault("job_gpu_blocks", [])
+        assert isinstance(output_samples, list)
+        output_samples.extend(job_gpu_blocks)
+
+        for name in EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES:
+            value = stats.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid external LOAD GPU block snapshot")
+            if name.startswith("current_"):
+                accumulator[name] = value
+            else:
+                accumulator[name] = max(accumulator.get(name, 0), value)
+
     def _aggregate_fused_store_stage_latency_stats(
         self, stats: dict[str, Any]
     ) -> None:
@@ -242,6 +336,16 @@ class OffloadingConnectorStats(KVConnectorStats):
             output_latencies = accumulator.setdefault(stage, [])
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
+
+    def _aggregate_fused_store_dedup_stats(self, stats: dict[str, int]) -> None:
+        if set(stats) - set(FUSED_STORE_DEDUP_STAT_NAMES):
+            raise ValueError("unknown fused STORE dedup statistic")
+        accumulator = self.data.setdefault(FUSED_STORE_DEDUP_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for name, value in stats.items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid fused STORE dedup statistic")
+            accumulator[name] = accumulator.get(name, 0) + value
 
     def _aggregate_fused_load_stage_latency_stats(
         self, stats: dict[str, Any]
@@ -360,6 +464,17 @@ class OffloadingConnectorStats(KVConnectorStats):
                 for name, value in ops_list.items():
                     return_dict[f"tiering_lookup_{name}"] = value
                 continue
+            if transfer_type == DPU_LOOKUP_STAGE_LATENCY_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for stage, latencies in ops_list.items():
+                    assert isinstance(latencies, list)
+                    return_dict[
+                        f"dpu_lookup_{stage}_latency_count"
+                    ] = len(latencies)
+                    return_dict[
+                        f"dpu_lookup_{stage}_latency_sum"
+                    ] = sum(latencies)
+                continue
             if transfer_type == PRIMARY_EVICTION_STATS_KEY:
                 assert isinstance(ops_list, dict)
                 for cause, cause_stats in ops_list.items():
@@ -377,6 +492,21 @@ class OffloadingConnectorStats(KVConnectorStats):
                     return_dict[
                         f"external_load_{stage}_latency_sum"
                     ] = sum(latencies)
+                continue
+            if transfer_type == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                job_gpu_blocks = ops_list.get("job_gpu_blocks", [])
+                assert isinstance(job_gpu_blocks, list)
+                return_dict["external_load_gpu_block_job_count"] = len(
+                    job_gpu_blocks
+                )
+                return_dict["external_load_gpu_block_job_sum"] = sum(
+                    job_gpu_blocks
+                )
+                for name in EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES:
+                    return_dict[f"external_load_gpu_block_{name}"] = (
+                        ops_list.get(name, 0)
+                    )
                 continue
             if transfer_type == FUSED_LOAD_STAGE_LATENCY_STATS_KEY:
                 assert isinstance(ops_list, dict)
@@ -399,6 +529,11 @@ class OffloadingConnectorStats(KVConnectorStats):
                     return_dict[
                         f"fused_store_{stage}_latency_sum"
                     ] = sum(latencies)
+                continue
+            if transfer_type == FUSED_STORE_DEDUP_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for name, value in ops_list.items():
+                    return_dict[f"fused_store_dedup_{name}"] = value
                 continue
             if transfer_type == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                 assert isinstance(ops_list, dict)
@@ -485,6 +620,12 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_tiering_lookup_stats(stats)
 
+    def record_dpu_lookup_stage_latency_stats(
+        self, stats: dict[str, list[float]]
+    ) -> None:
+        if stats:
+            self._aggregate_dpu_lookup_stage_latency_stats(stats)
+
     def record_primary_eviction_stats(self, stats: dict[str, dict[str, int]]) -> None:
         if not stats:
             return
@@ -497,12 +638,21 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_external_load_stage_latency_stats(stats)
 
+    def record_external_load_gpu_block_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        self._aggregate_external_load_gpu_block_stats(stats)
+
     def record_fused_store_stage_latency_stats(
         self, stats: dict[str, list[float]]
     ) -> None:
         if not stats:
             return
         self._aggregate_fused_store_stage_latency_stats(stats)
+
+    def record_fused_store_dedup_stats(self, stats: dict[str, int]) -> None:
+        if stats:
+            self._aggregate_fused_store_dedup_stats(stats)
 
     def record_fused_load_stage_latency_stats(
         self, stats: dict[str, list[float]]
@@ -591,6 +741,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.histogram_external_load_stage_latency: dict[
             tuple[int, str], PromMetricT
         ] = {}
+        self.histogram_dpu_lookup_stage_latency: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
         self.histogram_fused_load_stage_latency: dict[
             tuple[int, str], PromMetricT
         ] = {}
@@ -631,6 +784,60 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.counter_rdma_transport_stats: dict[
             tuple[int, str, str], PromMetricT
         ] = {}
+        self.counter_fused_store_dedup: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        external_load_gpu_block_buckets = list(
+            EXTERNAL_LOAD_GPU_BLOCK_BUCKETS
+        )
+        histogram_external_load_gpu_blocks = self._histogram_cls(
+            name="vllm:kv_offload_external_load_gpu_blocks",
+            documentation=(
+                "Number of Host HBM PagedKV blocks reserved by one logical "
+                "external LOAD job."
+            ),
+            buckets=external_load_gpu_block_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_external_load_gpu_blocks = {
+            idx: histogram_external_load_gpu_blocks.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+        external_load_gauge_docs = {
+            "current_inflight_gpu_blocks": (
+                "Current number of Host HBM PagedKV blocks reserved by "
+                "in-flight external LOAD jobs."
+            ),
+            "peak_inflight_gpu_blocks": (
+                "Process-lifetime peak Host HBM PagedKV blocks reserved by "
+                "concurrent external LOAD jobs."
+            ),
+            "max_job_gpu_blocks": (
+                "Process-lifetime maximum Host HBM PagedKV blocks reserved "
+                "by one external LOAD job."
+            ),
+            "current_inflight_jobs": (
+                "Current number of in-flight logical external LOAD jobs."
+            ),
+            "peak_inflight_jobs": (
+                "Process-lifetime peak number of concurrent logical "
+                "external LOAD jobs."
+            ),
+        }
+        self.gauge_external_load_gpu_blocks: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        for name, documentation in external_load_gauge_docs.items():
+            metric = self._gauge_cls(
+                name=f"vllm:kv_offload_external_load_{name}",
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            for idx, values in per_engine_labelvalues.items():
+                self.gauge_external_load_gpu_blocks[(idx, name)] = (
+                    metric.labels(*values)
+                )
         gauge_primary_cache_usage = self._gauge_cls(
             name="vllm:kv_offload_primary_cache_usage_perc",
             documentation=(
@@ -659,6 +866,18 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             2,
             5,
             10,
+        ]
+        dpu_lookup_latency_buckets = [
+            0.000001,
+            0.000002,
+            0.000005,
+            0.00001,
+            0.00002,
+            0.00005,
+            0.0001,
+            0.0002,
+            0.0005,
+            *latency_buckets[1:],
         ]
 
         self._counter_kv_bytes = self._counter_cls(
@@ -698,6 +917,15 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 "Request-visible latency for each external KV LOAD stage."
             ),
             buckets=latency_buckets[:],
+            labelnames=labelnames + ["stage"],
+        )
+
+        self._histogram_dpu_lookup_stage_latency = self._histogram_cls(
+            name="vllm:kv_offload_dpu_lookup_stage_latency_seconds",
+            documentation=(
+                "Latency decomposition for DPU-owned presence lookup."
+            ),
+            buckets=dpu_lookup_latency_buckets,
             labelnames=labelnames + ["stage"],
         )
 
@@ -883,6 +1111,14 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             )
             for name, documentation in rdma_counter_docs.items()
         }
+        self._counter_fused_store_dedup = self._counter_cls(
+            name="vllm:kv_offload_fused_store_dedup_total",
+            documentation=(
+                "BF3-owned fused STORE candidates, skips, transfers, work "
+                "requests, and bytes."
+            ),
+            labelnames=labelnames + ["stat"],
+        )
 
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
@@ -916,17 +1152,26 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == TIERING_LOOKUP_STATS_KEY:
                 self._observe_tiering_lookup_stats(ops, engine_idx)
                 continue
+            if transfer_type == DPU_LOOKUP_STAGE_LATENCY_STATS_KEY:
+                self._observe_dpu_lookup_stage_latency_stats(ops, engine_idx)
+                continue
             if transfer_type == PRIMARY_EVICTION_STATS_KEY:
                 self._observe_primary_eviction_stats(ops, engine_idx)
                 continue
             if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_external_load_stage_latency_stats(ops, engine_idx)
                 continue
+            if transfer_type == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
+                self._observe_external_load_gpu_block_stats(ops, engine_idx)
+                continue
             if transfer_type == FUSED_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_fused_load_stage_latency_stats(ops, engine_idx)
                 continue
             if transfer_type == FUSED_STORE_STAGE_LATENCY_STATS_KEY:
                 self._observe_fused_store_stage_latency_stats(ops, engine_idx)
+                continue
+            if transfer_type == FUSED_STORE_DEDUP_STATS_KEY:
+                self._observe_fused_store_dedup_stats(ops, engine_idx)
                 continue
             if transfer_type == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                 self._observe_post_store_primary_ready_reuse_stats(ops, engine_idx)
@@ -1071,6 +1316,23 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                     latency_s
                 )
 
+    def _observe_external_load_gpu_block_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        job_gpu_blocks = stats.get("job_gpu_blocks", [])
+        if not isinstance(job_gpu_blocks, list):
+            raise ValueError("invalid external LOAD job GPU block samples")
+        for value in job_gpu_blocks:
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid external LOAD job GPU block sample")
+            self.histogram_external_load_gpu_blocks[engine_idx].observe(value)
+
+        for name in EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES:
+            value = stats.get(name, 0)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid external LOAD GPU block snapshot")
+            self.gauge_external_load_gpu_blocks[(engine_idx, name)].set(value)
+
     def _observe_fused_store_stage_latency_stats(
         self, stats: dict[str, Any], engine_idx: int
     ) -> None:
@@ -1088,6 +1350,23 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.histogram_fused_store_stage_latency[counter_key].observe(
                     latency_s
                 )
+
+    def _observe_fused_store_dedup_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        if set(stats) - set(FUSED_STORE_DEDUP_STAT_NAMES):
+            raise ValueError("unknown fused STORE dedup statistic")
+        for name, value in stats.items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid fused STORE dedup statistic")
+            key = (engine_idx, name)
+            if key not in self.counter_fused_store_dedup:
+                self.counter_fused_store_dedup[key] = (
+                    self._counter_fused_store_dedup.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [name])
+                    )
+                )
+            self.counter_fused_store_dedup[key].inc(value)
 
     def _observe_fused_load_stage_latency_stats(
         self, stats: dict[str, Any], engine_idx: int
@@ -1252,6 +1531,24 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                         )
                     )
                 self.counter_tiering_lookup_cpu_seconds[counter_key].inc(value)
+
+    def _observe_dpu_lookup_stage_latency_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        assert isinstance(stats, dict)
+        for stage, latencies in stats.items():
+            counter_key = (engine_idx, stage)
+            if counter_key not in self.histogram_dpu_lookup_stage_latency:
+                self.histogram_dpu_lookup_stage_latency[counter_key] = (
+                    self._histogram_dpu_lookup_stage_latency.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [stage])
+                    )
+                )
+            assert isinstance(latencies, list)
+            for latency_s in latencies:
+                self.histogram_dpu_lookup_stage_latency[counter_key].observe(
+                    latency_s
+                )
 
     def _observe_primary_eviction_stats(
         self, stats: dict[str, Any], engine_idx: int

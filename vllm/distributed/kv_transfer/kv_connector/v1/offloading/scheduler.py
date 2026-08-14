@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -71,6 +72,9 @@ class TransferJobStatus:
     # path. This is not a worker/native transport submission timestamp.
     load_job_created_at_s: float | None = None
     external_load_started_at_s: float | None = None
+    # Exact number of non-null Host HBM PagedKV blocks held by this LOAD.
+    # Counted from logical job creation until every TP worker completes.
+    load_gpu_block_count: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -204,6 +208,9 @@ class RequestOffloadState:
     external_ready_observed_at_s: float | None = None
     gpu_allocation_first_failed_at_s: float | None = None
     gpu_allocation_completed_at_s: float | None = None
+    # The worker completion may be revisited while the request is still
+    # blocked; record the queue-timeline boundary only once.
+    external_load_ready_recorded: bool = False
     # Prevent the allocation-wait sample from being emitted twice when the
     # scheduler-revisit breakdown is also enabled.
     gpu_allocation_wait_recorded: bool = False
@@ -338,6 +345,12 @@ class OffloadingConnectorScheduler:
         self._external_load_stage_latency_stats: defaultdict[
             str, list[float]
         ] = defaultdict(list)
+        self._external_load_job_gpu_block_counts: list[int] = []
+        self._external_load_inflight_gpu_blocks = 0
+        self._external_load_peak_inflight_gpu_blocks = 0
+        self._external_load_max_job_gpu_blocks = 0
+        self._external_load_inflight_jobs = 0
+        self._external_load_peak_inflight_jobs = 0
         self._scheduler_iteration_started_at_s: float | None = None
         self._scheduler_waiting_phase_started_at_s: float | None = None
 
@@ -345,6 +358,37 @@ class OffloadingConnectorScheduler:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
+
+    def _start_external_load_gpu_block_tracking(
+        self, gpu_block_count: int
+    ) -> None:
+        if gpu_block_count < 0:
+            raise ValueError("external LOAD GPU block count must be non-negative")
+        self._external_load_job_gpu_block_counts.append(gpu_block_count)
+        self._external_load_inflight_gpu_blocks += gpu_block_count
+        self._external_load_peak_inflight_gpu_blocks = max(
+            self._external_load_peak_inflight_gpu_blocks,
+            self._external_load_inflight_gpu_blocks,
+        )
+        self._external_load_max_job_gpu_blocks = max(
+            self._external_load_max_job_gpu_blocks,
+            gpu_block_count,
+        )
+        self._external_load_inflight_jobs += 1
+        self._external_load_peak_inflight_jobs = max(
+            self._external_load_peak_inflight_jobs,
+            self._external_load_inflight_jobs,
+        )
+
+    def _finish_external_load_gpu_block_tracking(
+        self, gpu_block_count: int
+    ) -> None:
+        if gpu_block_count < 0:
+            raise ValueError("external LOAD GPU block count must be non-negative")
+        self._external_load_inflight_gpu_blocks -= gpu_block_count
+        self._external_load_inflight_jobs -= 1
+        assert self._external_load_inflight_gpu_blocks >= 0
+        assert self._external_load_inflight_jobs >= 0
 
     def _start_load_job_created_to_gpu_ready_timing(
         self,
@@ -816,6 +860,20 @@ class OffloadingConnectorScheduler:
                   (between scheduler steps).
         """
         req_status = self._req_status[request.request_id]
+        if req_status.transfer_jobs:
+            # A preempted request can return to the waiting queue before its
+            # earlier asynchronous STORE jobs have reached the scheduler-side
+            # completion barrier.  Do not let that request allocate GPU blocks
+            # and create a LOAD concurrently with those jobs.  Returning None
+            # keeps it in the ordinary lookup-deferred path; the scheduler will
+            # revisit it after connector completions drain transfer_jobs.
+            logger.debug(
+                "Delaying external lookup for request %s until pending "
+                "transfer jobs %s finish",
+                request.request_id,
+                sorted(req_status.transfer_jobs),
+            )
+            return None, False
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
@@ -823,6 +881,12 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens = self._lookup(req_status)
+        if num_hit_tokens is not None:
+            on_lookup_resolved = getattr(
+                self.manager, "on_lookup_resolved", None
+            )
+            if callable(on_lookup_resolved):
+                on_lookup_resolved(req_status.req_context)
         if (
             num_hit_tokens
             and getattr(self, "_profile_scheduler_revisit", False)
@@ -946,6 +1010,9 @@ class OffloadingConnectorScheduler:
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+        load_gpu_block_count = sum(
+            block_id != 0 for block_id in dst_block_ids
+        )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -978,7 +1045,9 @@ class OffloadingConnectorScheduler:
             is_store=False,
             load_job_created_at_s=load_job_created_at_s,
             external_load_started_at_s=external_load_started_at_s,
+            load_gpu_block_count=load_gpu_block_count,
         )
+        self._start_external_load_gpu_block_tracking(load_gpu_block_count)
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
@@ -1293,6 +1362,11 @@ class OffloadingConnectorScheduler:
                     success=success,
                 )
             else:
+                if not req_status.external_load_ready_recorded:
+                    req_status.req.record_event(
+                        EngineCoreEventType.EXTERNAL_LOAD_READY
+                    )
+                    req_status.external_load_ready_recorded = True
                 if success:
                     self._record_load_gpu_ready(job_status)
                     self.manager.complete_load(
@@ -1304,6 +1378,9 @@ class OffloadingConnectorScheduler:
                     )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
+                self._finish_external_load_gpu_block_tracking(
+                    job_status.load_gpu_block_count
+                )
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
@@ -1397,6 +1474,13 @@ class OffloadingConnectorScheduler:
         if hasattr(self.manager, "take_tiering_lookup_stats"):
             tiering_lookup_stats = self.manager.take_tiering_lookup_stats()
             stats.record_tiering_lookup_stats(tiering_lookup_stats)
+        if hasattr(self.manager, "take_dpu_lookup_stage_latency_stats"):
+            dpu_lookup_stage_latency_stats = (
+                self.manager.take_dpu_lookup_stage_latency_stats()
+            )
+            stats.record_dpu_lookup_stage_latency_stats(
+                dpu_lookup_stage_latency_stats
+            )
         if hasattr(self.manager, "take_primary_eviction_stats"):
             primary_eviction_stats = self.manager.take_primary_eviction_stats()
             stats.record_primary_eviction_stats(primary_eviction_stats)
@@ -1440,6 +1524,33 @@ class OffloadingConnectorScheduler:
                 }
             )
             self._external_load_stage_latency_stats.clear()
+        job_gpu_blocks = getattr(
+            self, "_external_load_job_gpu_block_counts", []
+        )
+        gpu_block_stats = {
+            "job_gpu_blocks": list(job_gpu_blocks),
+            "current_inflight_gpu_blocks": getattr(
+                self, "_external_load_inflight_gpu_blocks", 0
+            ),
+            "peak_inflight_gpu_blocks": getattr(
+                self, "_external_load_peak_inflight_gpu_blocks", 0
+            ),
+            "max_job_gpu_blocks": getattr(
+                self, "_external_load_max_job_gpu_blocks", 0
+            ),
+            "current_inflight_jobs": getattr(
+                self, "_external_load_inflight_jobs", 0
+            ),
+            "peak_inflight_jobs": getattr(
+                self, "_external_load_peak_inflight_jobs", 0
+            ),
+        }
+        if job_gpu_blocks or any(
+            value for name, value in gpu_block_stats.items()
+            if name != "job_gpu_blocks"
+        ):
+            stats.record_external_load_gpu_block_stats(gpu_block_stats)
+            job_gpu_blocks.clear()
         return None if stats.is_empty() else stats
 
     def reset_cache(self) -> None:
@@ -1465,6 +1576,8 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._external_load_inflight_gpu_blocks = 0
+        self._external_load_inflight_jobs = 0
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.

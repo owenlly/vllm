@@ -176,6 +176,10 @@ class Request:
         # Set after the first failed GPU KV-block allocation for an async
         # external LOAD, so retries record a single wait-start event.
         self.external_load_gpu_block_wait_started = False
+        # Request-queue diagnostics use scheduler-iteration timestamps so the
+        # lookup interval has the same boundaries as QUEUED -> SCHEDULED.
+        self.external_lookup_started_recorded = False
+        self.external_lookup_finished_recorded = False
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
