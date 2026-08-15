@@ -205,6 +205,13 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        computed_blocks, num_new_computed_tokens = self.peek_computed_blocks(request)
+        self.record_prefix_cache_lookup(request, num_new_computed_tokens)
+        return computed_blocks, num_new_computed_tokens
+
+    def peek_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+        """Read the local prefix-cache match without recording statistics."""
+
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -225,15 +232,20 @@ class KVCacheManager:
             )
         )
 
+        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def record_prefix_cache_lookup(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        """Record one scheduler-consumed local prefix-cache lookup."""
+
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
-                num_hits=num_new_computed_tokens,
+                num_hits=num_computed_tokens,
                 preempted=request.num_preemptions > 0,
             )
-
-        return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def allocate_slots(
         self,

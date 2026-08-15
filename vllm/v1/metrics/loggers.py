@@ -470,6 +470,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        counter_hbm_ready_admissions = self._counter_cls(
+            name="vllm:hbm_ready_admissions",
+            documentation=(
+                "Number of local HBM-ready requests admitted from the "
+                "highest-priority execution-ready queue."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_hbm_ready_admissions = create_metric_per_engine(
+            counter_hbm_ready_admissions, per_engine_labelvalues
+        )
+
         counter_external_load_ready_admissions = self._counter_cls(
             name="vllm:external_load_ready_admissions",
             documentation=(
@@ -1190,6 +1202,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_hbm_ready_admissions[engine_idx].inc(
+                scheduler_stats.hbm_ready_admissions
+            )
             self.counter_external_load_ready_admissions[engine_idx].inc(
                 scheduler_stats.external_load_ready_admissions
             )

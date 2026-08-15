@@ -25,6 +25,10 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import (
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType, FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -1133,6 +1137,79 @@ def test_take_ready_waiting_requests_preserves_fcfs_order():
     assert not scheduler.waiting
 
 
+def test_hbm_and_load_ready_share_highest_fcfs_tier():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.external_ready_bypass_cap = 1
+    scheduler.external_ready_age_threshold_s = 0.0
+    hbm, lookup, load, ordinary = create_requests(
+        num_requests=4,
+        req_ids=["hbm", "lookup", "load", "ordinary"],
+    )
+    for request in (hbm, lookup, load, ordinary):
+        scheduler.waiting.add_request(request)
+
+    # The execution-ready tier merges HBM_READY and LOAD_READY under the
+    # configured queue policy. LOOKUP_READY and ordinary work stay below it,
+    # even after the lookup-ready fairness cap has been reached.
+    execution_ready = scheduler._take_ready_waiting_requests({"hbm", "load"})
+    lookup_ready = scheduler._take_ready_waiting_requests({"lookup"})
+    scheduler._consecutive_external_ready_admissions = 1
+
+    selected, kind, forced_ordinary = (
+        scheduler._select_external_ready_or_fcfs_queue(
+            execution_ready, lookup_ready
+        )
+    )
+    assert selected is execution_ready
+    assert kind == "execution"
+    assert not forced_ordinary
+    assert [request.request_id for request in execution_ready] == [
+        "hbm",
+        "load",
+    ]
+
+    execution_ready.pop_request()
+    selected, kind, forced_ordinary = (
+        scheduler._select_external_ready_or_fcfs_queue(
+            execution_ready, lookup_ready
+        )
+    )
+    assert selected is execution_ready
+    assert kind == "execution"
+    assert not forced_ordinary
+
+
+def test_hbm_ready_hint_is_side_effect_free_and_revalidated():
+    block_size = 16
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.connector = Mock()
+    scheduler.kv_cache_manager = Mock()
+    scheduler.hbm_ready_req_ids = set()
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["hbm"],
+    )
+    scheduler.kv_cache_manager.peek_computed_blocks = Mock(
+        return_value=(Mock(), block_size)
+    )
+    scheduler.connector.can_skip_external_lookup = Mock(return_value=True)
+
+    scheduler._refresh_hbm_ready_hint(request)
+    assert scheduler.hbm_ready_req_ids == {request.request_id}
+    scheduler.connector.can_skip_external_lookup.assert_called_once_with(
+        request, block_size
+    )
+
+    scheduler.connector.can_skip_external_lookup.return_value = False
+    scheduler._refresh_hbm_ready_hint(request)
+    assert not scheduler.hbm_ready_req_ids
+
+
 def test_external_lookup_ready_request_is_revisited_before_pending():
     block_size = 16
     matched_tokens = block_size * 2
@@ -1284,6 +1361,7 @@ def test_external_ready_bypass_cap_interleaves_fcfs(
     )
     stats = scheduler.make_stats()
     assert stats is not None
+    assert stats.hbm_ready_admissions == 0
     assert stats.external_lookup_ready_admissions == 3
     assert stats.external_load_ready_admissions == 0
     assert stats.external_ready_fcfs_turns == (1 if bypass_cap else 0)
@@ -1292,6 +1370,7 @@ def test_external_ready_bypass_cap_interleaves_fcfs(
     )
     drained = scheduler.make_stats()
     assert drained is not None
+    assert drained.hbm_ready_admissions == 0
     assert drained.external_lookup_ready_admissions == 0
     assert drained.external_load_ready_admissions == 0
     assert drained.external_ready_fcfs_turns == 0

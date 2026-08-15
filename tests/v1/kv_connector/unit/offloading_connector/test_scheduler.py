@@ -240,6 +240,23 @@ def test_external_load_stage_latency_tracks_request_critical_path():
     }
 
 
+def test_can_skip_external_lookup_requires_no_complete_offload_block():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = SimpleNamespace(
+        kv_group_configs=[SimpleNamespace(offloaded_block_size=128)]
+    )
+    scheduler._lookup_groups = (0,)
+    scheduler._sliding_window_groups = ()
+    scheduler._req_status = {"request": SimpleNamespace(transfer_jobs=set())}
+    request = SimpleNamespace(request_id="request", num_tokens=256)
+
+    assert not scheduler.can_skip_external_lookup(request, 128)
+    assert scheduler.can_skip_external_lookup(request, 144)
+
+    scheduler._req_status["request"].transfer_jobs.add(7)
+    assert not scheduler.can_skip_external_lookup(request, 144)
+
+
 def test_take_external_lookup_ready_request_ids_forwards_manager_hints():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = MagicMock()

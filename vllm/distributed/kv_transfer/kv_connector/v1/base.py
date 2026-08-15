@@ -550,6 +550,17 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def can_skip_external_lookup(
+        self, request: "Request", num_computed_tokens: int
+    ) -> bool:
+        """Return whether local KV covers every externally loadable block.
+
+        This optional, side-effect-free hint lets the scheduler recognize a
+        request that can make model progress immediately from local HBM. The
+        normal lookup remains authoritative when the method returns ``False``.
+        """
+        return False
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

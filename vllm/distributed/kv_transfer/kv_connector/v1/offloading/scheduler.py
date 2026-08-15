@@ -930,6 +930,24 @@ class OffloadingConnectorScheduler:
             return set()
         return set(take_ready())
 
+    def can_skip_external_lookup(
+        self, request: Request, num_computed_tokens: int
+    ) -> bool:
+        """Whether local HBM leaves no complete offload block to query."""
+
+        req_status = self._req_status[request.request_id]
+        if req_status.transfer_jobs:
+            return False
+
+        max_hit_size_tokens = request.num_tokens
+        if self._sliding_window_groups:
+            max_hit_size_tokens -= 1
+        return all(
+            max_hit_size_tokens - num_computed_tokens
+            < self.config.kv_group_configs[group_idx].offloaded_block_size
+            for group_idx in self._lookup_groups
+        )
+
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):

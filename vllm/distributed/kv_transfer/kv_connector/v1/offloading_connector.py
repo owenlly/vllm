@@ -165,6 +165,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_external_lookup_ready_request_ids()
 
+    def can_skip_external_lookup(
+        self, request: Request, num_computed_tokens: int
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.can_skip_external_lookup(
+            request, num_computed_tokens
+        )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
