@@ -177,6 +177,13 @@ class SchedulerStats:
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
 
+    # Delta counters and current streak for FR-FCFS-style external-ready
+    # scheduling. Deltas are drained each time Scheduler.make_stats() runs.
+    external_load_ready_admissions: int = 0
+    external_lookup_ready_admissions: int = 0
+    external_ready_fcfs_turns: int = 0
+    external_ready_admission_streak: int = 0
+
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0

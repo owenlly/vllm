@@ -185,6 +185,33 @@ class Scheduler(SchedulerInterface):
         # transient scheduling constraint can consume the edge, requeue the
         # request as ordinary waiting work, and add an unbounded queue delay.
         self.external_lookup_ready_req_ids: set[str] = set()
+        # FR-FCFS-style fairness control for external-ready requests. Zero
+        # preserves the original unbounded ready-first policy. A positive cap
+        # limits how many ready admissions may bypass ordinary FCFS work before
+        # one schedulable ordinary request gets a turn. Keep the streak across
+        # scheduler iterations; resetting it every iteration would still starve
+        # ordinary work when only one running slot becomes free at a time.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        external_ready_bypass_cap = (
+            0
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "external_ready_bypass_cap", 0
+            )
+        )
+        if (
+            isinstance(external_ready_bypass_cap, bool)
+            or not isinstance(external_ready_bypass_cap, int)
+            or external_ready_bypass_cap < 0
+        ):
+            raise ValueError(
+                "external_ready_bypass_cap must be a non-negative integer"
+            )
+        self.external_ready_bypass_cap = external_ready_bypass_cap
+        self._consecutive_external_ready_admissions = 0
+        self._external_load_ready_admissions = 0
+        self._external_lookup_ready_admissions = 0
+        self._external_ready_fcfs_turns = 0
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -607,12 +634,22 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request_queue = (
-                    external_load_ready_waiting
-                    or external_lookup_ready_waiting
-                    or self._select_waiting_queue_for_scheduling()
+                request_queue, fairness_forced_ordinary = (
+                    self._select_external_ready_or_fcfs_queue(
+                        external_load_ready_waiting,
+                        external_lookup_ready_waiting,
+                    )
                 )
                 assert request_queue is not None
+                external_ready_kind = (
+                    "load"
+                    if request_queue is external_load_ready_waiting
+                    else (
+                        "lookup"
+                        if request_queue is external_lookup_ready_waiting
+                        else None
+                    )
+                )
                 lookup_ready_request = (
                     request_queue is external_lookup_ready_waiting
                 )
@@ -771,6 +808,10 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if fairness_forced_ordinary:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -792,6 +833,10 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if fairness_forced_ordinary:
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -803,6 +848,10 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        if fairness_forced_ordinary:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -862,6 +911,10 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if fairness_forced_ordinary:
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     break
 
                 # Close the async external-LOAD admission interval at the
@@ -916,6 +969,10 @@ class Scheduler(SchedulerInterface):
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
+                    self._record_external_ready_admission(
+                        external_ready_kind,
+                        fairness_forced_ordinary,
+                    )
                     continue
 
                 self.running.append(request)
@@ -939,6 +996,10 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._record_external_ready_admission(
+                    external_ready_kind,
+                    fairness_forced_ordinary,
+                )
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1795,6 +1856,51 @@ class Scheduler(SchedulerInterface):
 
         return self.waiting or self.skipped_waiting or None
 
+    def _select_external_ready_or_fcfs_queue(
+        self,
+        external_load_ready: RequestQueue,
+        external_lookup_ready: RequestQueue,
+    ) -> tuple[RequestQueue | None, bool]:
+        """Apply ready-first scheduling with an optional starvation cap.
+
+        Returns the selected queue and whether an ordinary queue was selected
+        only because the ready-bypass cap was reached. The latter lets the
+        caller fall back to ready work instead of idling when that ordinary
+        request is not currently schedulable.
+        """
+
+        ready = external_load_ready or external_lookup_ready or None
+        ordinary = self._select_waiting_queue_for_scheduling()
+        if ready is None:
+            return ordinary, False
+        if ordinary is None or self.external_ready_bypass_cap == 0:
+            return ready, False
+        if (
+            self._consecutive_external_ready_admissions
+            < self.external_ready_bypass_cap
+        ):
+            return ready, False
+        return ordinary, True
+
+    def _record_external_ready_admission(
+        self,
+        external_ready_kind: str | None,
+        fairness_forced_ordinary: bool,
+    ) -> None:
+        if external_ready_kind == "load":
+            self._external_load_ready_admissions += 1
+        elif external_ready_kind == "lookup":
+            self._external_lookup_ready_admissions += 1
+        elif fairness_forced_ordinary:
+            self._external_ready_fcfs_turns += 1
+
+        if self.external_ready_bypass_cap == 0:
+            return
+        if external_ready_kind is None:
+            self._consecutive_external_ready_admissions = 0
+        else:
+            self._consecutive_external_ready_admissions += 1
+
     def _take_ready_waiting_requests(
         self, request_ids: set[str]
     ) -> RequestQueue:
@@ -2185,10 +2291,20 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
-        return SchedulerStats(
+        stats = SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            external_load_ready_admissions=(
+                self._external_load_ready_admissions
+            ),
+            external_lookup_ready_admissions=(
+                self._external_lookup_ready_admissions
+            ),
+            external_ready_fcfs_turns=self._external_ready_fcfs_turns,
+            external_ready_admission_streak=(
+                self._consecutive_external_ready_admissions
+            ),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
@@ -2198,6 +2314,10 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )
+        self._external_load_ready_admissions = 0
+        self._external_lookup_ready_admissions = 0
+        self._external_ready_fcfs_turns = 0
+        return stats
 
     def make_spec_decoding_stats(
         self,

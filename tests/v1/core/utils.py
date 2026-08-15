@@ -58,6 +58,7 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    external_ready_bypass_cap: int = 0,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -106,6 +107,7 @@ def create_scheduler(
             kv_connector_extra_config={
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
+                "external_ready_bypass_cap": external_ready_bypass_cap,
             },
         )
     elif isinstance(use_kv_connector, str):

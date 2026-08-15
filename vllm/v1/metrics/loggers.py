@@ -470,6 +470,55 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_scheduler_waiting, per_engine_labelvalues
         )
 
+        counter_external_load_ready_admissions = self._counter_cls(
+            name="vllm:external_load_ready_admissions",
+            documentation=(
+                "Number of completed external LOAD requests admitted ahead "
+                "of or alongside ordinary FCFS work."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_external_load_ready_admissions = create_metric_per_engine(
+            counter_external_load_ready_admissions, per_engine_labelvalues
+        )
+
+        counter_external_lookup_ready_admissions = self._counter_cls(
+            name="vllm:external_lookup_ready_admissions",
+            documentation=(
+                "Number of resolved external lookup requests admitted ahead "
+                "of or alongside ordinary FCFS work."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_external_lookup_ready_admissions = create_metric_per_engine(
+            counter_external_lookup_ready_admissions, per_engine_labelvalues
+        )
+
+        counter_external_ready_fcfs_turns = self._counter_cls(
+            name="vllm:external_ready_fcfs_turns",
+            documentation=(
+                "Number of ordinary FCFS admissions forced by the external "
+                "ready bypass cap."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_external_ready_fcfs_turns = create_metric_per_engine(
+            counter_external_ready_fcfs_turns, per_engine_labelvalues
+        )
+
+        gauge_external_ready_admission_streak = self._gauge_cls(
+            name="vllm:external_ready_admission_streak",
+            documentation=(
+                "Current consecutive external-ready admission streak used "
+                "by the FR-FCFS-style fairness cap."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_external_ready_admission_streak = create_metric_per_engine(
+            gauge_external_ready_admission_streak, per_engine_labelvalues
+        )
+
         gauge_waiting_by_reason = self._gauge_cls(
             name="vllm:num_requests_waiting_by_reason",
             documentation=(
@@ -1141,6 +1190,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.counter_external_load_ready_admissions[engine_idx].inc(
+                scheduler_stats.external_load_ready_admissions
+            )
+            self.counter_external_lookup_ready_admissions[engine_idx].inc(
+                scheduler_stats.external_lookup_ready_admissions
+            )
+            self.counter_external_ready_fcfs_turns[engine_idx].inc(
+                scheduler_stats.external_ready_fcfs_turns
+            )
+            self.gauge_external_ready_admission_streak[engine_idx].set(
+                scheduler_stats.external_ready_admission_streak
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

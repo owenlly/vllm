@@ -1242,6 +1242,204 @@ def test_external_lookup_ready_hint_survives_full_running_capacity():
     assert not scheduler.external_lookup_ready_req_ids
 
 
+@pytest.mark.parametrize(
+    "bypass_cap, expected_order",
+    [
+        (0, ["ready-a", "ready-b", "ready-c", "ordinary"]),
+        (2, ["ready-a", "ready-b", "ordinary", "ready-c"]),
+    ],
+)
+def test_external_ready_bypass_cap_interleaves_fcfs(
+    bypass_cap: int, expected_order: list[str]
+):
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=4,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=bypass_cap,
+    )
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ready-a", "ready-b", "ready-c", "ordinary"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready-a", "ready-b", "ready-c"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    output = scheduler.schedule()
+
+    assert [request.req_id for request in output.scheduled_new_reqs] == (
+        expected_order
+    )
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.external_lookup_ready_admissions == 3
+    assert stats.external_load_ready_admissions == 0
+    assert stats.external_ready_fcfs_turns == (1 if bypass_cap else 0)
+    assert stats.external_ready_admission_streak == (
+        1 if bypass_cap else 0
+    )
+    drained = scheduler.make_stats()
+    assert drained is not None
+    assert drained.external_lookup_ready_admissions == 0
+    assert drained.external_load_ready_admissions == 0
+    assert drained.external_ready_fcfs_turns == 0
+
+
+def test_external_ready_bypass_cap_persists_across_iterations():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size * 2,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=2,
+    )
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ready-a", "ready-b", "ready-c", "ordinary"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        side_effect=(
+            {"ready-a", "ready-b", "ready-c"},
+            set(),
+            set(),
+            set(),
+        )
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    scheduled_order = []
+    for _ in range(4):
+        output = scheduler.schedule()
+        (scheduled_request,) = output.scheduled_new_reqs
+        scheduled_order.append(scheduled_request.req_id)
+        scheduler.finish_requests(
+            scheduled_request.req_id, RequestStatus.FINISHED_ABORTED
+        )
+
+    assert scheduled_order == [
+        "ready-a",
+        "ready-b",
+        "ordinary",
+        "ready-c",
+    ]
+
+
+def test_external_ready_bypass_cap_bounds_continuous_ready_traffic():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size * 2,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=2,
+    )
+    ready_ids = [f"ready-{index}" for index in range(6)]
+    ordinary_ids = [f"ordinary-{index}" for index in range(3)]
+    for request in create_requests(
+        num_requests=9,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=[*ready_ids, *ordinary_ids],
+    ):
+        scheduler.add_request(request)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        side_effect=[set(ready_ids), *([set()] * 8)]
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    scheduled_order = []
+    for _ in range(9):
+        output = scheduler.schedule()
+        (scheduled_request,) = output.scheduled_new_reqs
+        scheduled_order.append(scheduled_request.req_id)
+        scheduler.finish_requests(
+            scheduled_request.req_id, RequestStatus.FINISHED_ABORTED
+        )
+
+    assert scheduled_order == [
+        "ready-0",
+        "ready-1",
+        "ordinary-0",
+        "ready-2",
+        "ready-3",
+        "ordinary-1",
+        "ready-4",
+        "ready-5",
+        "ordinary-2",
+    ]
+
+
+def test_external_ready_cap_falls_back_when_fcfs_request_is_pending():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size * 2,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=1,
+    )
+    ordinary, ready = create_requests(
+        num_requests=2,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ordinary-pending", "ready"],
+    )
+    scheduler.add_request(ordinary)
+    scheduler.add_request(ready)
+    scheduler._consecutive_external_ready_admissions = 1
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        side_effect=lambda request, _: (
+            (0, False) if request.request_id == "ready" else (None, False)
+        )
+    )
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_new_reqs[0].req_id == "ready"
+    assert ordinary in scheduler.skipped_waiting
+
+
+def test_external_ready_bypass_cap_rejects_invalid_value():
+    with pytest.raises(
+        ValueError,
+        match="external_ready_bypass_cap must be a non-negative integer",
+    ):
+        create_scheduler(
+            use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+            external_ready_bypass_cap=-1,
+        )
+
+
 def test_completed_external_load_waits_for_normal_running_capacity():
     block_size = 16
     scheduler = create_scheduler(
