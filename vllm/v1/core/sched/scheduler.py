@@ -180,6 +180,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # DPU-owned lookup completions are edge-triggered by the connector.
+        # Keep the hint until the request is actually revisited. Otherwise a
+        # transient scheduling constraint can consume the edge, requeue the
+        # request as ordinary waiting work, and add an unbounded queue delay.
+        self.external_lookup_ready_req_ids: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -561,18 +566,56 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        external_load_ready_waiting = create_request_queue(self.policy)
+        external_lookup_ready_waiting = create_request_queue(self.policy)
+        if (
+            self._pause_state == PauseState.UNPAUSED
+            and not preempted_reqs
+        ):
+            # A completed external LOAD already owns GPU KV blocks. Revisit
+            # it ahead of ordinary waiting work so those blocks become useful
+            # promptly, but keep the normal token/running/preemption gates.
+            # This is deliberately not the burst-drain policy: it reserves no
+            # token budget and never bypasses scheduling constraints.
+            external_load_ready_waiting = (
+                self._take_ready_waiting_requests(
+                    self.finished_recving_kv_req_ids
+                )
+            )
+            if self.connector is not None:
+                self.external_lookup_ready_req_ids.update(
+                    self.connector.take_external_lookup_ready_request_ids()
+                )
+                external_lookup_ready_waiting = (
+                    self._take_ready_waiting_requests(
+                        self.external_lookup_ready_req_ids
+                    )
+                )
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             if self.connector is not None:
                 self.connector.on_scheduler_waiting_phase_start()
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                external_load_ready_waiting
+                or external_lookup_ready_waiting
+                or self.waiting
+                or self.skipped_waiting
+            ) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
+                request_queue = (
+                    external_load_ready_waiting
+                    or external_lookup_ready_waiting
+                    or self._select_waiting_queue_for_scheduling()
+                )
                 assert request_queue is not None
+                lookup_ready_request = (
+                    request_queue is external_lookup_ready_waiting
+                )
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
@@ -627,6 +670,12 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        if lookup_ready_request:
+                            # The completion edge has now been consumed by a
+                            # real lookup revisit. If this call discovers more
+                            # unresolved keys, the connector will publish a new
+                            # edge when those keys become ready.
+                            self.external_lookup_ready_req_ids.discard(request_id)
                         self._record_external_lookup_started(
                             request, scheduled_timestamp
                         )
@@ -912,6 +961,21 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            # Requeue in reverse priority order so completed LOADs stay ahead
+            # of resolved LOOKUPs, while both persistent ID sets retain their
+            # hints until an actual revisit consumes them.
+            for ready_queue in (
+                external_lookup_ready_waiting,
+                external_load_ready_waiting,
+            ):
+                if ready_queue:
+                    remaining_ready = tuple(ready_queue)
+                    if self.policy == SchedulingPolicy.FCFS:
+                        for request in reversed(remaining_ready):
+                            self.skipped_waiting.prepend_request(request)
+                    else:
+                        for request in remaining_ready:
+                            self.skipped_waiting.add_request(request)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1731,6 +1795,25 @@ class Scheduler(SchedulerInterface):
 
         return self.waiting or self.skipped_waiting or None
 
+    def _take_ready_waiting_requests(
+        self, request_ids: set[str]
+    ) -> RequestQueue:
+        """Extract selected waiting requests into a one-step priority queue."""
+
+        ready = create_request_queue(self.policy)
+        if not request_ids:
+            return ready
+        for source in (self.skipped_waiting, self.waiting):
+            matches = [
+                request
+                for request in source
+                if request.request_id in request_ids
+            ]
+            source.remove_requests(matches)
+            for request in matches:
+                ready.add_request(request)
+        return ready
+
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
@@ -1948,6 +2031,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self.external_lookup_ready_req_ids.discard(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id

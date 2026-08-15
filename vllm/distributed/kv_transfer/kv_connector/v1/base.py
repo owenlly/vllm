@@ -542,6 +542,14 @@ class KVConnectorBase_V1(ABC):
         """Notify the connector that waiting-request scheduling has started."""
         return
 
+    def take_external_lookup_ready_request_ids(self) -> set[str]:
+        """Return requests whose asynchronous external lookup is resolved.
+
+        The IDs are scheduler hints only. The scheduler must still call
+        :meth:`get_num_new_matched_tokens` before allocating any KV blocks.
+        """
+        return set()
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

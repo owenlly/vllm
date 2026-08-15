@@ -222,7 +222,6 @@ def test_external_load_stage_latency_tracks_request_critical_path():
                 external_load_started_at_s=external_started_at_s,
             )
         )
-
     assert scheduler._external_load_stage_latency_stats == {
         "secondary_submit_to_primary_published": [1.0],
         "scheduler_gap": [0.25],
@@ -238,6 +237,20 @@ def test_external_load_stage_latency_tracks_request_critical_path():
         "scheduler_build_load_spec": [0.125],
         "scheduler_job_created_to_gpu_ready": [0.5],
         "secondary_submit_to_gpu_ready": [1.75],
+    }
+
+
+def test_take_external_lookup_ready_request_ids_forwards_manager_hints():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = MagicMock()
+    scheduler.manager.take_external_lookup_ready_request_ids.return_value = {
+        "ready-b",
+        "ready-a",
+    }
+
+    assert scheduler.take_external_lookup_ready_request_ids() == {
+        "ready-a",
+        "ready-b",
     }
 
 

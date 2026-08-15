@@ -920,6 +920,16 @@ class OffloadingConnectorScheduler:
             return
         self._scheduler_waiting_phase_started_at_s = time.monotonic()
 
+    def take_external_lookup_ready_request_ids(self) -> set[str]:
+        take_ready = getattr(
+            self.manager,
+            "take_external_lookup_ready_request_ids",
+            None,
+        )
+        if not callable(take_ready):
+            return set()
+        return set(take_ready())
+
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):

@@ -161,6 +161,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_scheduler_waiting_phase_start()
 
+    def take_external_lookup_ready_request_ids(self) -> set[str]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_external_lookup_ready_request_ids()
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:

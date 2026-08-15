@@ -1108,6 +1108,186 @@ def test_scheduler_stats_waiting_queues():
     assert stats.num_skipped_waiting_reqs == 2  # 2 blocked by constraints
 
 
+def test_take_ready_waiting_requests_preserves_fcfs_order():
+    scheduler = create_scheduler()
+    requests = create_requests(
+        num_requests=4,
+        req_ids=["skipped-a", "ready-b", "skipped-c", "ready-d"],
+    )
+    for request in requests[:3]:
+        scheduler.skipped_waiting.add_request(request)
+    scheduler.waiting.add_request(requests[3])
+
+    ready = scheduler._take_ready_waiting_requests(
+        {"ready-b", "ready-d", "finished-request"}
+    )
+
+    assert [request.request_id for request in ready] == [
+        "ready-b",
+        "ready-d",
+    ]
+    assert [request.request_id for request in scheduler.skipped_waiting] == [
+        "skipped-a",
+        "skipped-c",
+    ]
+    assert not scheduler.waiting
+
+
+def test_external_lookup_ready_request_is_revisited_before_pending():
+    block_size = 16
+    matched_tokens = block_size * 2
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(
+            matched_tokens=matched_tokens,
+            is_async=True,
+        ),
+    )
+    pending, ready = create_requests(
+        num_requests=2,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["pending", "ready"],
+    )
+    scheduler.add_request(pending)
+    scheduler.add_request(ready)
+    scheduler.waiting.remove_requests((pending, ready))
+    scheduler.skipped_waiting.add_request(pending)
+    scheduler.skipped_waiting.add_request(ready)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        side_effect=lambda request, _: (
+            (matched_tokens, True)
+            if request.request_id == "ready"
+            else (None, False)
+        )
+    )
+
+    scheduler.schedule()
+
+    lookup_order = [
+        call.args[0].request_id
+        for call in scheduler.connector.get_num_new_matched_tokens.call_args_list
+    ]
+    assert lookup_order[0] == "ready"
+    assert ready.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert pending in scheduler.skipped_waiting
+
+
+def test_external_lookup_ready_hint_survives_full_running_capacity():
+    block_size = 16
+    matched_tokens = block_size * 2
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(
+            matched_tokens=matched_tokens,
+            is_async=True,
+        ),
+    )
+    (blocker,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["blocker"],
+    )
+    scheduler.add_request(blocker)
+    scheduler.schedule()
+    assert blocker.status == RequestStatus.RUNNING
+
+    pending, ready = create_requests(
+        num_requests=2,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["pending", "ready"],
+    )
+    scheduler.add_request(pending)
+    scheduler.add_request(ready)
+    scheduler.waiting.remove_requests((pending, ready))
+    scheduler.skipped_waiting.add_request(pending)
+    scheduler.skipped_waiting.add_request(ready)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        side_effect=({"ready"}, set())
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        side_effect=lambda request, _: (
+            (matched_tokens, True)
+            if request.request_id == "ready"
+            else (None, False)
+        )
+    )
+
+    # The connector edge arrives while the only running slot is occupied.
+    scheduler.schedule()
+    scheduler.connector.get_num_new_matched_tokens.assert_not_called()
+    assert scheduler.external_lookup_ready_req_ids == {"ready"}
+
+    scheduler.finish_requests("blocker", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    lookup_order = [
+        call.args[0].request_id
+        for call in scheduler.connector.get_num_new_matched_tokens.call_args_list
+    ]
+    assert lookup_order[0] == "ready"
+    assert ready.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert not scheduler.external_lookup_ready_req_ids
+
+
+def test_completed_external_load_waits_for_normal_running_capacity():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=1,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+    )
+    (blocker,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["blocker"],
+    )
+    scheduler.add_request(blocker)
+    scheduler.schedule()
+    assert blocker.status == RequestStatus.RUNNING
+
+    (ready,) = create_requests(
+        num_requests=1,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["load-ready"],
+    )
+    scheduler.add_request(ready)
+    scheduler.waiting.remove_request(ready)
+    ready.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    ready.num_computed_tokens = block_size * 2
+    scheduler.skipped_waiting.add_request(ready)
+    scheduler.finished_recving_kv_req_ids.add(ready.request_id)
+    scheduler._update_waiting_for_remote_kv = Mock()
+
+    # Persistent-ready does not burst past max_num_seqs. The completion stays
+    # pending until ordinary scheduler capacity becomes available.
+    scheduler.schedule()
+    scheduler._update_waiting_for_remote_kv.assert_not_called()
+    assert ready in scheduler.skipped_waiting
+    assert ready.request_id in scheduler.finished_recving_kv_req_ids
+
+    scheduler.finish_requests("blocker", RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+
+    scheduler._update_waiting_for_remote_kv.assert_called_once_with(ready)
+    assert output.scheduled_new_reqs[0].req_id == ready.request_id
+
+
 def _assert_right_scheduler_output(
     output: SchedulerOutput,
     num_requests: int,
@@ -3816,10 +3996,12 @@ def test_prepend_skipped_requests_order():
     assert waiting_reqs == expected_waiting_reqs
 
 
-def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
+def test_completed_remote_kv_is_revisited_before_grammar_prefix():
     scheduler = create_scheduler(max_num_seqs=1)
     scheduler.connector = Mock()
     scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+    scheduler.connector.get_external_prefix_cache_hit_tokens.return_value = 0
+    scheduler.connector.take_external_lookup_ready_request_ids.return_value = set()
 
     requests = create_requests(num_requests=4)
     for request in requests:
@@ -3846,14 +4028,14 @@ def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
     output = scheduler.schedule()
 
     assert output.scheduled_new_reqs
-    assert output.scheduled_new_reqs[0].req_id == req_grammar_1.request_id
+    assert output.scheduled_new_reqs[0].req_id == req_remote.request_id
     waiting_req_ids = [
         req.request_id
         for req in list(scheduler.skipped_waiting) + list(scheduler.waiting)
     ]
     assert waiting_req_ids == [
+        req_grammar_1.request_id,
         req_grammar_2.request_id,
-        req_remote.request_id,
         req_tail.request_id,
     ]
 
@@ -3890,8 +4072,8 @@ def test_fcfs_mixed_skipped_waiting_types_keep_order():
 
     second_output = scheduler.schedule()
     expected_order = [
-        req_grammar.request_id,
         req_remote.request_id,
+        req_grammar.request_id,
         req_stream.request_id,
         req_tail.request_id,
     ]
