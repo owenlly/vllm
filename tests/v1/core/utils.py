@@ -59,6 +59,7 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     external_ready_bypass_cap: int = 0,
+    external_ready_age_threshold_ms: int = 0,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -108,6 +109,9 @@ def create_scheduler(
                 "matched_tokens": use_kv_connector.matched_tokens,
                 "is_async": use_kv_connector.is_async,
                 "external_ready_bypass_cap": external_ready_bypass_cap,
+                "external_ready_age_threshold_ms": (
+                    external_ready_age_threshold_ms
+                ),
             },
         )
     elif isinstance(use_kv_connector, str):

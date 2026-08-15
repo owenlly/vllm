@@ -208,6 +208,25 @@ class Scheduler(SchedulerInterface):
                 "external_ready_bypass_cap must be a non-negative integer"
             )
         self.external_ready_bypass_cap = external_ready_bypass_cap
+        external_ready_age_threshold_ms = (
+            0
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "external_ready_age_threshold_ms", 0
+            )
+        )
+        if (
+            isinstance(external_ready_age_threshold_ms, bool)
+            or not isinstance(external_ready_age_threshold_ms, int)
+            or external_ready_age_threshold_ms < 0
+        ):
+            raise ValueError(
+                "external_ready_age_threshold_ms must be a "
+                "non-negative integer"
+            )
+        self.external_ready_age_threshold_s = (
+            external_ready_age_threshold_ms / 1000.0
+        )
         self._consecutive_external_ready_admissions = 0
         self._external_load_ready_admissions = 0
         self._external_lookup_ready_admissions = 0
@@ -1879,6 +1898,12 @@ class Scheduler(SchedulerInterface):
             self._consecutive_external_ready_admissions
             < self.external_ready_bypass_cap
         ):
+            return ready, False
+        ordinary_age_s = max(
+            time.time() - ordinary.peek_request().arrival_time,
+            0.0,
+        )
+        if ordinary_age_s < self.external_ready_age_threshold_s:
             return ready, False
         return ordinary, True
 

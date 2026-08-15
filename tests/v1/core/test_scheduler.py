@@ -1394,6 +1394,81 @@ def test_external_ready_bypass_cap_bounds_continuous_ready_traffic():
     ]
 
 
+def test_external_ready_age_threshold_keeps_young_fcfs_behind_ready():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=4,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=2,
+        external_ready_age_threshold_ms=500,
+    )
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ready-a", "ready-b", "ready-c", "ordinary"],
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready-a", "ready-b", "ready-c"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    output = scheduler.schedule()
+
+    assert [request.req_id for request in output.scheduled_new_reqs] == [
+        "ready-a",
+        "ready-b",
+        "ready-c",
+        "ordinary",
+    ]
+
+
+def test_external_ready_age_threshold_protects_aged_fcfs():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=4,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=2,
+        external_ready_age_threshold_ms=500,
+    )
+    requests = create_requests(
+        num_requests=4,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ready-a", "ready-b", "ready-c", "ordinary"],
+    )
+    requests[-1].arrival_time -= 1.0
+    for request in requests:
+        scheduler.add_request(request)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready-a", "ready-b", "ready-c"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    output = scheduler.schedule()
+
+    assert [request.req_id for request in output.scheduled_new_reqs] == [
+        "ready-a",
+        "ready-b",
+        "ordinary",
+        "ready-c",
+    ]
+
+
 def test_external_ready_cap_falls_back_when_fcfs_request_is_pending():
     block_size = 16
     scheduler = create_scheduler(
@@ -1437,6 +1512,19 @@ def test_external_ready_bypass_cap_rejects_invalid_value():
         create_scheduler(
             use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
             external_ready_bypass_cap=-1,
+        )
+
+
+def test_external_ready_age_threshold_rejects_invalid_value():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "external_ready_age_threshold_ms must be a non-negative integer"
+        ),
+    ):
+        create_scheduler(
+            use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+            external_ready_age_threshold_ms=-1,
         )
 
 
