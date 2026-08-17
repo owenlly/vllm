@@ -189,13 +189,26 @@ class Scheduler(SchedulerInterface):
         # query. Hints are revalidated before use because unpinned cache blocks
         # may be evicted after request arrival.
         self.hbm_ready_req_ids: set[str] = set()
-        # FR-FCFS-style fairness control for external-ready requests. Zero
+        # FR-FCFS-style fairness control for resolved external lookups. Zero
         # preserves the original unbounded ready-first policy. A positive cap
-        # limits how many ready admissions may bypass ordinary FCFS work before
-        # one schedulable ordinary request gets a turn. Keep the streak across
-        # scheduler iterations; resetting it every iteration would still starve
-        # ordinary work when only one running slot becomes free at a time.
+        # limits how many LOOKUP_READY admissions may bypass ordinary FCFS work
+        # before one schedulable ordinary request gets a turn. An optional age
+        # threshold independently forces that turn sooner. Keep the streak
+        # across scheduler iterations; resetting it every iteration would still
+        # starve ordinary work when only one running slot becomes free at a time.
         kv_transfer_config = self.vllm_config.kv_transfer_config
+        external_ready_policy = (
+            "fcfs"
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "external_ready_policy", "fcfs"
+            )
+        )
+        if external_ready_policy not in {"fcfs", "frfcfs"}:
+            raise ValueError(
+                "external_ready_policy must be fcfs or frfcfs"
+            )
+        self.external_ready_policy = external_ready_policy
         external_ready_bypass_cap = (
             0
             if kv_transfer_config is None
@@ -231,10 +244,34 @@ class Scheduler(SchedulerInterface):
         self.external_ready_age_threshold_s = (
             external_ready_age_threshold_ms / 1000.0
         )
-        self._consecutive_external_ready_admissions = 0
+        scheduler_trace_every = (
+            0
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "scheduler_trace_every", 0
+            )
+        )
+        if (
+            isinstance(scheduler_trace_every, bool)
+            or not isinstance(scheduler_trace_every, int)
+            or scheduler_trace_every < 0
+        ):
+            raise ValueError(
+                "scheduler_trace_every must be a non-negative integer"
+            )
+        self.scheduler_trace_every = scheduler_trace_every
+        self._scheduler_trace_decisions = 0
+        self._consecutive_external_lookup_bypasses = 0
         self._hbm_ready_admissions = 0
         self._external_load_ready_admissions = 0
         self._external_lookup_ready_admissions = 0
+        # Low-overhead shadow trace: count only successful ready admissions
+        # that displaced an available ordinary request. Together with the
+        # admission totals, these counters distinguish genuine reordering from
+        # ready work selected when no ordinary request could have run.
+        self._hbm_ready_bypasses = 0
+        self._external_load_ready_bypasses = 0
+        self._external_lookup_ready_bypasses = 0
         self._external_ready_fcfs_turns = 0
 
         # Encoder-related.
@@ -619,6 +656,7 @@ class Scheduler(SchedulerInterface):
 
         execution_ready_waiting = create_request_queue(self.policy)
         external_lookup_ready_waiting = create_request_queue(self.policy)
+        baseline_fcfs_head: Request | None = None
         if (
             self._pause_state == PauseState.UNPAUSED
             and not preempted_reqs
@@ -630,25 +668,31 @@ class Scheduler(SchedulerInterface):
             # token budget and never bypasses scheduling constraints.
             ordinary = self._select_waiting_queue_for_scheduling()
             if ordinary is not None:
-                self._refresh_hbm_ready_hint(ordinary.peek_request())
-            execution_ready_waiting = self._take_ready_waiting_requests(
-                self.finished_recving_kv_req_ids | self.hbm_ready_req_ids
-            )
+                baseline_fcfs_head = ordinary.peek_request()
+            if self.external_ready_policy == "frfcfs":
+                if baseline_fcfs_head is not None:
+                    self._refresh_hbm_ready_hint(baseline_fcfs_head)
+                execution_ready_waiting = self._take_ready_waiting_requests(
+                    self.finished_recving_kv_req_ids | self.hbm_ready_req_ids
+                )
             if self.connector is not None:
-                self.external_lookup_ready_req_ids.update(
+                lookup_ready_ids = (
                     self.connector.take_external_lookup_ready_request_ids()
                 )
-                external_lookup_ready_waiting = (
-                    self._take_ready_waiting_requests(
-                        self.external_lookup_ready_req_ids
+                if self.external_ready_policy == "frfcfs":
+                    self.external_lookup_ready_req_ids.update(lookup_ready_ids)
+                    external_lookup_ready_waiting = (
+                        self._take_ready_waiting_requests(
+                            self.external_lookup_ready_req_ids
+                        )
                     )
-                )
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             if self.connector is not None:
                 self.connector.on_scheduler_waiting_phase_start()
             step_skipped_waiting = create_request_queue(self.policy)
+            first_waiting_selection = True
 
             while (
                 execution_ready_waiting
@@ -659,11 +703,14 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request_queue, ready_kind, fairness_forced_ordinary = (
-                    self._select_external_ready_or_fcfs_queue(
-                        execution_ready_waiting,
-                        external_lookup_ready_waiting,
-                    )
+                (
+                    request_queue,
+                    ready_kind,
+                    fairness_forced_ordinary,
+                    ready_bypassed_ordinary,
+                ) = self._select_external_ready_or_fcfs_queue(
+                    execution_ready_waiting,
+                    external_lookup_ready_waiting,
                 )
                 assert request_queue is not None
                 request = request_queue.peek_request()
@@ -679,6 +726,38 @@ class Scheduler(SchedulerInterface):
                 fallback_if_unschedulable = (
                     fairness_forced_ordinary or hbm_ready_request
                 )
+
+                if (
+                    self.scheduler_trace_every > 0
+                    and first_waiting_selection
+                    and baseline_fcfs_head is not None
+                ):
+                    self._scheduler_trace_decisions += 1
+                    if (
+                        self._scheduler_trace_decisions
+                        % self.scheduler_trace_every
+                        == 0
+                    ):
+                        baseline_age_ms = (
+                            max(
+                                time.time() - baseline_fcfs_head.arrival_time,
+                                0.0,
+                            )
+                            * 1000.0
+                        )
+                        logger.info(
+                            "DPU_SCHEDULER_TRACE baseline_fcfs=%s actual=%s "
+                            "actual_kind=%s changed=%s baseline_age_ms=%.3f "
+                            "lookup_bypass_streak=%d forced_ordinary=%s",
+                            baseline_fcfs_head.request_id,
+                            request_id,
+                            ready_kind or "ordinary",
+                            request_id != baseline_fcfs_head.request_id,
+                            baseline_age_ms,
+                            self._consecutive_external_lookup_bypasses,
+                            fairness_forced_ordinary,
+                        )
+                first_waiting_selection = False
 
                 hbm_ready_local_match: tuple[KVCacheBlocks, int] | None = None
                 if hbm_ready_request:
@@ -1016,6 +1095,7 @@ class Scheduler(SchedulerInterface):
                     self._record_external_ready_admission(
                         ready_kind,
                         fairness_forced_ordinary,
+                        ready_bypassed_ordinary,
                     )
                     continue
 
@@ -1043,6 +1123,7 @@ class Scheduler(SchedulerInterface):
                 self._record_external_ready_admission(
                     ready_kind,
                     fairness_forced_ordinary,
+                    ready_bypassed_ordinary,
                 )
                 if hbm_ready_request:
                     self.hbm_ready_req_ids.discard(request_id)
@@ -1929,7 +2010,7 @@ class Scheduler(SchedulerInterface):
         self,
         execution_ready: RequestQueue,
         external_lookup_ready: RequestQueue,
-    ) -> tuple[RequestQueue | None, str | None, bool]:
+    ) -> tuple[RequestQueue | None, str | None, bool, bool]:
         """Select HBM/LOAD-ready, LOOKUP-ready, or ordinary FCFS work.
 
         HBM-ready and completed external LOAD requests have already been
@@ -1941,45 +2022,57 @@ class Scheduler(SchedulerInterface):
 
         ordinary = self._select_waiting_queue_for_scheduling()
         if execution_ready:
-            return execution_ready, "execution", False
+            return execution_ready, "execution", False, ordinary is not None
         ready = external_lookup_ready or None
         if ready is None:
-            return ordinary, None, False
-        if ordinary is None or self.external_ready_bypass_cap == 0:
-            return ready, "lookup", False
-        if (
-            self._consecutive_external_ready_admissions
-            < self.external_ready_bypass_cap
-        ):
-            return ready, "lookup", False
+            return ordinary, None, False, False
+        if ordinary is None:
+            return ready, "lookup", False, False
+        if self.external_ready_bypass_cap == 0:
+            return ready, "lookup", False, True
         ordinary_age_s = max(
             time.time() - ordinary.peek_request().arrival_time,
             0.0,
         )
-        if ordinary_age_s < self.external_ready_age_threshold_s:
-            return ready, "lookup", False
-        return ordinary, None, True
+        cap_reached = (
+            self._consecutive_external_lookup_bypasses
+            >= self.external_ready_bypass_cap
+        )
+        age_reached = (
+            self.external_ready_age_threshold_s > 0
+            and ordinary_age_s >= self.external_ready_age_threshold_s
+        )
+        if not (cap_reached or age_reached):
+            return ready, "lookup", False, True
+        return ordinary, None, True, False
 
     def _record_external_ready_admission(
         self,
         ready_kind: str | None,
         fairness_forced_ordinary: bool,
+        ready_bypassed_ordinary: bool,
     ) -> None:
         if ready_kind == "hbm":
             self._hbm_ready_admissions += 1
+            if ready_bypassed_ordinary:
+                self._hbm_ready_bypasses += 1
         elif ready_kind == "load":
             self._external_load_ready_admissions += 1
+            if ready_bypassed_ordinary:
+                self._external_load_ready_bypasses += 1
         elif ready_kind == "lookup":
             self._external_lookup_ready_admissions += 1
+            if ready_bypassed_ordinary:
+                self._external_lookup_ready_bypasses += 1
         elif fairness_forced_ordinary:
             self._external_ready_fcfs_turns += 1
 
         if self.external_ready_bypass_cap == 0:
             return
-        if ready_kind in ("load", "lookup"):
-            self._consecutive_external_ready_admissions += 1
-        else:
-            self._consecutive_external_ready_admissions = 0
+        if ready_kind == "lookup" and ready_bypassed_ordinary:
+            self._consecutive_external_lookup_bypasses += 1
+        elif ready_kind is None:
+            self._consecutive_external_lookup_bypasses = 0
 
     def _take_ready_waiting_requests(
         self, request_ids: set[str]
@@ -2386,9 +2479,16 @@ class Scheduler(SchedulerInterface):
             external_lookup_ready_admissions=(
                 self._external_lookup_ready_admissions
             ),
+            hbm_ready_bypasses=self._hbm_ready_bypasses,
+            external_load_ready_bypasses=(
+                self._external_load_ready_bypasses
+            ),
+            external_lookup_ready_bypasses=(
+                self._external_lookup_ready_bypasses
+            ),
             external_ready_fcfs_turns=self._external_ready_fcfs_turns,
             external_ready_admission_streak=(
-                self._consecutive_external_ready_admissions
+                self._consecutive_external_lookup_bypasses
             ),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
@@ -2402,6 +2502,9 @@ class Scheduler(SchedulerInterface):
         self._hbm_ready_admissions = 0
         self._external_load_ready_admissions = 0
         self._external_lookup_ready_admissions = 0
+        self._hbm_ready_bypasses = 0
+        self._external_load_ready_bypasses = 0
+        self._external_lookup_ready_bypasses = 0
         self._external_ready_fcfs_turns = 0
         return stats
 

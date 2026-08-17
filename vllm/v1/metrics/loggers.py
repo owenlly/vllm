@@ -506,11 +506,47 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_external_lookup_ready_admissions, per_engine_labelvalues
         )
 
+        counter_hbm_ready_bypasses = self._counter_cls(
+            name="vllm:hbm_ready_bypasses",
+            documentation=(
+                "Number of successful HBM-ready admissions made while an "
+                "ordinary request was available."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_hbm_ready_bypasses = create_metric_per_engine(
+            counter_hbm_ready_bypasses, per_engine_labelvalues
+        )
+
+        counter_external_load_ready_bypasses = self._counter_cls(
+            name="vllm:external_load_ready_bypasses",
+            documentation=(
+                "Number of successful LOAD-ready admissions made while an "
+                "ordinary request was available."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_external_load_ready_bypasses = create_metric_per_engine(
+            counter_external_load_ready_bypasses, per_engine_labelvalues
+        )
+
+        counter_external_lookup_ready_bypasses = self._counter_cls(
+            name="vllm:external_lookup_ready_bypasses",
+            documentation=(
+                "Number of successful LOOKUP-ready admissions made while an "
+                "ordinary request was available."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_external_lookup_ready_bypasses = create_metric_per_engine(
+            counter_external_lookup_ready_bypasses, per_engine_labelvalues
+        )
+
         counter_external_ready_fcfs_turns = self._counter_cls(
             name="vllm:external_ready_fcfs_turns",
             documentation=(
-                "Number of ordinary FCFS admissions forced by the external "
-                "ready bypass cap."
+                "Number of ordinary FCFS admissions forced by the resolved "
+                "external lookup bypass cap or age threshold."
             ),
             labelnames=labelnames,
         )
@@ -521,8 +557,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         gauge_external_ready_admission_streak = self._gauge_cls(
             name="vllm:external_ready_admission_streak",
             documentation=(
-                "Current consecutive external-ready admission streak used "
-                "by the FR-FCFS-style fairness cap."
+                "Current consecutive LOOKUP_READY admissions that bypassed "
+                "ordinary work under the FR-FCFS-style fairness cap."
             ),
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
@@ -1210,6 +1246,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.counter_external_lookup_ready_admissions[engine_idx].inc(
                 scheduler_stats.external_lookup_ready_admissions
+            )
+            self.counter_hbm_ready_bypasses[engine_idx].inc(
+                scheduler_stats.hbm_ready_bypasses
+            )
+            self.counter_external_load_ready_bypasses[engine_idx].inc(
+                scheduler_stats.external_load_ready_bypasses
+            )
+            self.counter_external_lookup_ready_bypasses[engine_idx].inc(
+                scheduler_stats.external_lookup_ready_bypasses
             )
             self.counter_external_ready_fcfs_turns[engine_idx].inc(
                 scheduler_stats.external_ready_fcfs_turns

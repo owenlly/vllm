@@ -1156,9 +1156,9 @@ def test_hbm_and_load_ready_share_highest_fcfs_tier():
     # even after the lookup-ready fairness cap has been reached.
     execution_ready = scheduler._take_ready_waiting_requests({"hbm", "load"})
     lookup_ready = scheduler._take_ready_waiting_requests({"lookup"})
-    scheduler._consecutive_external_ready_admissions = 1
+    scheduler._consecutive_external_lookup_bypasses = 1
 
-    selected, kind, forced_ordinary = (
+    selected, kind, forced_ordinary, ready_bypassed_ordinary = (
         scheduler._select_external_ready_or_fcfs_queue(
             execution_ready, lookup_ready
         )
@@ -1166,13 +1166,14 @@ def test_hbm_and_load_ready_share_highest_fcfs_tier():
     assert selected is execution_ready
     assert kind == "execution"
     assert not forced_ordinary
+    assert ready_bypassed_ordinary
     assert [request.request_id for request in execution_ready] == [
         "hbm",
         "load",
     ]
 
     execution_ready.pop_request()
-    selected, kind, forced_ordinary = (
+    selected, kind, forced_ordinary, ready_bypassed_ordinary = (
         scheduler._select_external_ready_or_fcfs_queue(
             execution_ready, lookup_ready
         )
@@ -1180,6 +1181,107 @@ def test_hbm_and_load_ready_share_highest_fcfs_tier():
     assert selected is execution_ready
     assert kind == "execution"
     assert not forced_ordinary
+    assert ready_bypassed_ordinary
+
+
+def test_lookup_bypass_streak_ignores_non_bypass_admissions():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.external_ready_bypass_cap = 4
+    scheduler._consecutive_external_lookup_bypasses = 2
+    scheduler._hbm_ready_admissions = 0
+    scheduler._external_load_ready_admissions = 0
+    scheduler._external_lookup_ready_admissions = 0
+    scheduler._hbm_ready_bypasses = 0
+    scheduler._external_load_ready_bypasses = 0
+    scheduler._external_lookup_ready_bypasses = 0
+    scheduler._external_ready_fcfs_turns = 0
+
+    # Highest-tier work neither consumes nor resets the LOOKUP_READY bypass
+    # budget. A lookup with no ordinary request to bypass also does not count.
+    scheduler._record_external_ready_admission("load", False, True)
+    scheduler._record_external_ready_admission("hbm", False, True)
+    scheduler._record_external_ready_admission("lookup", False, False)
+    assert scheduler._consecutive_external_lookup_bypasses == 2
+
+    scheduler._record_external_ready_admission("lookup", False, True)
+    assert scheduler._consecutive_external_lookup_bypasses == 3
+
+    # Any successfully admitted ordinary request ends the bypass streak.
+    scheduler._record_external_ready_admission(None, False, False)
+    assert scheduler._consecutive_external_lookup_bypasses == 0
+    assert scheduler._external_load_ready_admissions == 1
+    assert scheduler._hbm_ready_admissions == 1
+    assert scheduler._external_lookup_ready_admissions == 2
+    assert scheduler._hbm_ready_bypasses == 1
+    assert scheduler._external_load_ready_bypasses == 1
+    assert scheduler._external_lookup_ready_bypasses == 1
+
+
+def test_lookup_without_ordinary_does_not_consume_bypass_budget():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.external_ready_bypass_cap = 4
+    scheduler.external_ready_age_threshold_s = 0.5
+    scheduler._consecutive_external_lookup_bypasses = 3
+    (lookup,) = create_requests(num_requests=1, req_ids=["lookup"])
+    lookup_ready = create_request_queue(scheduler.policy)
+    lookup_ready.add_request(lookup)
+    execution_ready = create_request_queue(scheduler.policy)
+
+    selected, kind, forced_ordinary, lookup_bypassed_ordinary = (
+        scheduler._select_external_ready_or_fcfs_queue(
+            execution_ready, lookup_ready
+        )
+    )
+
+    assert selected is lookup_ready
+    assert kind == "lookup"
+    assert not forced_ordinary
+    assert not lookup_bypassed_ordinary
+
+
+def test_scheduler_trace_compares_fcfs_head_with_actual_selection(caplog):
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_seqs=2,
+        max_num_batched_tokens=block_size * 4,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_bypass_cap=4,
+        external_ready_age_threshold_ms=100,
+        scheduler_trace_every=1,
+    )
+    ordinary, ready = create_requests(
+        num_requests=2,
+        num_tokens=block_size * 2,
+        block_size=block_size,
+        req_ids=["ordinary", "ready"],
+    )
+    scheduler.add_request(ordinary)
+    scheduler.add_request(ready)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(0, False)
+    )
+
+    with caplog.at_level("INFO", logger="vllm.v1.core.sched.scheduler"):
+        scheduler.schedule()
+
+    (trace,) = [
+        record.message
+        for record in caplog.records
+        if "DPU_SCHEDULER_TRACE" in record.message
+    ]
+    assert "baseline_fcfs=ordinary" in trace
+    assert "actual=ready" in trace
+    assert "actual_kind=lookup" in trace
+    assert "changed=True" in trace
 
 
 def test_hbm_ready_hint_is_side_effect_free_and_revalidated():
@@ -1254,6 +1356,40 @@ def test_external_lookup_ready_request_is_revisited_before_pending():
     assert lookup_order[0] == "ready"
     assert ready.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert pending in scheduler.skipped_waiting
+
+
+def test_fcfs_policy_does_not_reorder_external_lookup_ready_request():
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        max_num_batched_tokens=block_size * 8,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+        external_ready_policy="fcfs",
+    )
+    ordinary, ready = create_requests(
+        num_requests=2,
+        num_tokens=block_size * 4,
+        block_size=block_size,
+        req_ids=["ordinary", "ready"],
+    )
+    scheduler.add_request(ordinary)
+    scheduler.add_request(ready)
+
+    assert scheduler.connector is not None
+    scheduler.connector.take_external_lookup_ready_request_ids = Mock(
+        return_value={"ready"}
+    )
+    scheduler.connector.get_num_new_matched_tokens = Mock(
+        return_value=(None, False)
+    )
+
+    scheduler.schedule()
+
+    lookup_order = [
+        call.args[0].request_id
+        for call in scheduler.connector.get_num_new_matched_tokens.call_args_list
+    ]
+    assert lookup_order[:2] == ["ordinary", "ready"]
 
 
 def test_external_lookup_ready_hint_survives_full_running_capacity():
@@ -1364,15 +1500,15 @@ def test_external_ready_bypass_cap_interleaves_fcfs(
     assert stats.hbm_ready_admissions == 0
     assert stats.external_lookup_ready_admissions == 3
     assert stats.external_load_ready_admissions == 0
+    assert stats.external_lookup_ready_bypasses == (3 if not bypass_cap else 2)
     assert stats.external_ready_fcfs_turns == (1 if bypass_cap else 0)
-    assert stats.external_ready_admission_streak == (
-        1 if bypass_cap else 0
-    )
+    assert stats.external_ready_admission_streak == 0
     drained = scheduler.make_stats()
     assert drained is not None
     assert drained.hbm_ready_admissions == 0
     assert drained.external_lookup_ready_admissions == 0
     assert drained.external_load_ready_admissions == 0
+    assert drained.external_lookup_ready_bypasses == 0
     assert drained.external_ready_fcfs_turns == 0
 
 
@@ -1473,7 +1609,7 @@ def test_external_ready_bypass_cap_bounds_continuous_ready_traffic():
     ]
 
 
-def test_external_ready_age_threshold_keeps_young_fcfs_behind_ready():
+def test_external_ready_bypass_cap_protects_young_fcfs():
     block_size = 16
     scheduler = create_scheduler(
         block_size=block_size,
@@ -1505,8 +1641,8 @@ def test_external_ready_age_threshold_keeps_young_fcfs_behind_ready():
     assert [request.req_id for request in output.scheduled_new_reqs] == [
         "ready-a",
         "ready-b",
-        "ready-c",
         "ordinary",
+        "ready-c",
     ]
 
 
@@ -1541,9 +1677,9 @@ def test_external_ready_age_threshold_protects_aged_fcfs():
     output = scheduler.schedule()
 
     assert [request.req_id for request in output.scheduled_new_reqs] == [
+        "ordinary",
         "ready-a",
         "ready-b",
-        "ordinary",
         "ready-c",
     ]
 
@@ -1565,7 +1701,7 @@ def test_external_ready_cap_falls_back_when_fcfs_request_is_pending():
     )
     scheduler.add_request(ordinary)
     scheduler.add_request(ready)
-    scheduler._consecutive_external_ready_admissions = 1
+    scheduler._consecutive_external_lookup_bypasses = 1
 
     assert scheduler.connector is not None
     scheduler.connector.take_external_lookup_ready_request_ids = Mock(
@@ -1604,6 +1740,17 @@ def test_external_ready_age_threshold_rejects_invalid_value():
         create_scheduler(
             use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
             external_ready_age_threshold_ms=-1,
+        )
+
+
+def test_scheduler_trace_sampling_rejects_invalid_value():
+    with pytest.raises(
+        ValueError,
+        match="scheduler_trace_every must be a non-negative integer",
+    ):
+        create_scheduler(
+            use_kv_connector=mock_kv(matched_tokens=0, is_async=True),
+            scheduler_trace_every=-1,
         )
 
 

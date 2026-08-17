@@ -177,11 +177,14 @@ class SchedulerStats:
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
 
-    # Delta counters and current streak for execution/external-ready
-    # scheduling. Deltas are drained each time Scheduler.make_stats() runs.
+    # Delta counters and the current LOOKUP_READY-over-ordinary bypass streak.
+    # Deltas are drained each time Scheduler.make_stats() runs.
     hbm_ready_admissions: int = 0
     external_load_ready_admissions: int = 0
     external_lookup_ready_admissions: int = 0
+    hbm_ready_bypasses: int = 0
+    external_load_ready_bypasses: int = 0
+    external_lookup_ready_bypasses: int = 0
     external_ready_fcfs_turns: int = 0
     external_ready_admission_streak: int = 0
 
