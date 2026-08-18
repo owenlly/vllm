@@ -538,6 +538,74 @@ def test_aggregate_fused_store_dpu_dedup_stats():
     assert reduced["fused_store_dedup_bytes"] == 84 << 20
 
 
+def test_aggregate_fused_resident_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_fused_resident_stats(
+        "load",
+        {
+            "resident_hit_entries": 3,
+            "admitted_entries": 4,
+            "reject_frequency_entries": 2,
+            "resident_bytes": 84,
+            "staging_bytes": 24,
+            "storage_bytes": 60,
+            "rdma_bytes": 108,
+        },
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_fused_resident_stats(
+        "load",
+        {
+            "resident_hit_entries": 1,
+            "admitted_entries": 2,
+            "reject_no_victim_entries": 1,
+            "evictions": 2,
+            "resident_bytes": 36,
+            "staging_bytes": 12,
+            "storage_bytes": 24,
+            "rdma_bytes": 48,
+        },
+    )
+    stats2.record_fused_resident_stats(
+        "store",
+        {
+            "admitted_entries": 5,
+            "scratch_bytes": 20,
+            "rdma_bytes": 60,
+        },
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["fused_resident_load_resident_hit_entries"] == 4
+    assert reduced["fused_resident_load_admitted_entries"] == 6
+    assert reduced["fused_resident_load_reject_frequency_entries"] == 2
+    assert reduced["fused_resident_load_reject_no_victim_entries"] == 1
+    assert reduced["fused_resident_load_evictions"] == 2
+    assert reduced["fused_resident_load_resident_bytes"] == 120
+    assert reduced["fused_resident_load_staging_bytes"] == 36
+    assert reduced["fused_resident_load_storage_bytes"] == 84
+    assert reduced["fused_resident_load_rdma_bytes"] == 156
+    assert reduced["fused_resident_store_admitted_entries"] == 5
+    assert reduced["fused_resident_store_scratch_bytes"] == 20
+
+
+@pytest.mark.parametrize(
+    "operation,stats",
+    [
+        ("promotion", {"admitted_entries": 1}),
+        ("load", {"unknown": 1}),
+        ("load", {"admitted_entries": -1}),
+        ("load", {"admitted_entries": 1.5}),
+    ],
+)
+def test_fused_resident_stats_reject_invalid_values(operation, stats):
+    with pytest.raises(ValueError):
+        OffloadingConnectorStats().record_fused_resident_stats(
+            operation, stats
+        )
+
+
 def test_aggregate_fused_load_stage_latency_stats():
     """Rank-local fused LOAD stage samples aggregate across workers."""
     stats1 = OffloadingConnectorStats()

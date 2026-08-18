@@ -42,6 +42,22 @@ FUSED_STORE_DEDUP_STAT_NAMES = (
     "work_requests",
     "bytes",
 )
+FUSED_RESIDENT_STATS_KEY = "fused_resident_stats"
+FUSED_RESIDENT_STAT_NAMES = (
+    "resident_hit_entries",
+    "admitted_entries",
+    "reject_frequency_entries",
+    "reject_no_victim_entries",
+    "existing_ready_entries",
+    "existing_loading_entries",
+    "evictions",
+    "resident_bytes",
+    "staging_bytes",
+    "scratch_bytes",
+    "storage_bytes",
+    "rdma_bytes",
+)
+FUSED_RESIDENT_OPERATIONS = ("load", "store")
 POST_STORE_PRIMARY_READY_REUSE_STATS_KEY = "post_store_primary_ready_reuse_stats"
 POST_STORE_PRIMARY_READY_REUSE_COUNTER_NAMES = (
     "cohort_keys",
@@ -180,6 +196,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                     continue
                 if k == FUSED_STORE_DEDUP_STATS_KEY:
                     self._aggregate_fused_store_dedup_stats(v)
+                    continue
+                if k == FUSED_RESIDENT_STATS_KEY:
+                    self._aggregate_fused_resident_stats(v)
                     continue
                 if k == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                     self._aggregate_reuse_stats(k, v)
@@ -346,6 +365,23 @@ class OffloadingConnectorStats(KVConnectorStats):
             if not isinstance(value, int) or value < 0:
                 raise ValueError("invalid fused STORE dedup statistic")
             accumulator[name] = accumulator.get(name, 0) + value
+
+    def _aggregate_fused_resident_stats(
+        self, stats: dict[str, dict[str, int]]
+    ) -> None:
+        if set(stats) - set(FUSED_RESIDENT_OPERATIONS):
+            raise ValueError("unknown fused resident operation")
+        accumulator = self.data.setdefault(FUSED_RESIDENT_STATS_KEY, {})
+        assert isinstance(accumulator, dict)
+        for operation, operation_stats in stats.items():
+            if set(operation_stats) - set(FUSED_RESIDENT_STAT_NAMES):
+                raise ValueError("unknown fused resident statistic")
+            output = accumulator.setdefault(operation, {})
+            assert isinstance(output, dict)
+            for name, value in operation_stats.items():
+                if not isinstance(value, int) or value < 0:
+                    raise ValueError("invalid fused resident statistic")
+                output[name] = output.get(name, 0) + value
 
     def _aggregate_fused_load_stage_latency_stats(
         self, stats: dict[str, Any]
@@ -535,6 +571,15 @@ class OffloadingConnectorStats(KVConnectorStats):
                 for name, value in ops_list.items():
                     return_dict[f"fused_store_dedup_{name}"] = value
                 continue
+            if transfer_type == FUSED_RESIDENT_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for operation, operation_stats in ops_list.items():
+                    assert isinstance(operation_stats, dict)
+                    for name, value in operation_stats.items():
+                        return_dict[
+                            f"fused_resident_{operation}_{name}"
+                        ] = value
+                continue
             if transfer_type == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                 assert isinstance(ops_list, dict)
                 self._reduce_reuse_stats(
@@ -653,6 +698,12 @@ class OffloadingConnectorStats(KVConnectorStats):
     def record_fused_store_dedup_stats(self, stats: dict[str, int]) -> None:
         if stats:
             self._aggregate_fused_store_dedup_stats(stats)
+
+    def record_fused_resident_stats(
+        self, operation: str, stats: dict[str, int]
+    ) -> None:
+        if stats:
+            self._aggregate_fused_resident_stats({operation: stats})
 
     def record_fused_load_stage_latency_stats(
         self, stats: dict[str, list[float]]
@@ -786,6 +837,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         ] = {}
         self.counter_fused_store_dedup: dict[
             tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_fused_resident: dict[
+            tuple[int, str, str], PromMetricT
         ] = {}
         external_load_gpu_block_buckets = list(
             EXTERNAL_LOAD_GPU_BLOCK_BUCKETS
@@ -1119,6 +1173,14 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             ),
             labelnames=labelnames + ["stat"],
         )
+        self._counter_fused_resident = self._counter_cls(
+            name="vllm:kv_offload_fused_resident_total",
+            documentation=(
+                "BF3 resident admission events and byte accounting for fused "
+                "LOAD and STORE."
+            ),
+            labelnames=labelnames + ["operation", "stat"],
+        )
 
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
@@ -1172,6 +1234,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 continue
             if transfer_type == FUSED_STORE_DEDUP_STATS_KEY:
                 self._observe_fused_store_dedup_stats(ops, engine_idx)
+                continue
+            if transfer_type == FUSED_RESIDENT_STATS_KEY:
+                self._observe_fused_resident_stats(ops, engine_idx)
                 continue
             if transfer_type == POST_STORE_PRIMARY_READY_REUSE_STATS_KEY:
                 self._observe_post_store_primary_ready_reuse_stats(ops, engine_idx)
@@ -1367,6 +1432,29 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                     )
                 )
             self.counter_fused_store_dedup[key].inc(value)
+
+    def _observe_fused_resident_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        if set(stats) - set(FUSED_RESIDENT_OPERATIONS):
+            raise ValueError("unknown fused resident operation")
+        for operation, operation_stats in stats.items():
+            if set(operation_stats) - set(FUSED_RESIDENT_STAT_NAMES):
+                raise ValueError("unknown fused resident statistic")
+            for name, value in operation_stats.items():
+                if not isinstance(value, int) or value < 0:
+                    raise ValueError("invalid fused resident statistic")
+                key = (engine_idx, operation, name)
+                if key not in self.counter_fused_resident:
+                    self.counter_fused_resident[key] = (
+                        self._counter_fused_resident.labels(
+                            *(
+                                self.per_engine_labelvalues[engine_idx]
+                                + [operation, name]
+                            )
+                        )
+                    )
+                self.counter_fused_resident[key].inc(value)
 
     def _observe_fused_load_stage_latency_stats(
         self, stats: dict[str, Any], engine_idx: int

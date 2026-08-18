@@ -29,6 +29,8 @@ class TransferResult:
     # Optional connector-specific fused STORE stages, parallel to fused LOAD.
     fused_store_stage_latencies: dict[str, float] | None = None
     fused_store_dedup_stats: dict[str, int] | None = None
+    # Optional bounded resident/admission counters and byte accounting.
+    fused_resident_stats: dict[str, int] | None = None
 
 
 class OffloadingHandler(ABC):
