@@ -259,6 +259,7 @@ class KVCacheManager:
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
+        external_load_gpu_block_extent_size: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -289,6 +290,9 @@ class KVCacheManager:
                 made if it fits within (free blocks - reserved_blocks). Used to gate
                 async KV-connector loads so their initial allocation cannot consume
                 blocks an already in-flight (prefilling) sequence is relying on.
+            external_load_gpu_block_extent_size: Best-effort contiguous GPU-block
+                extent used only while allocating externally computed tokens.
+                Missing extents immediately fall back to ordinary allocation.
 
         Blocks layout:
         ```
@@ -420,6 +424,9 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                external_load_gpu_block_extent_size=(
+                    external_load_gpu_block_extent_size
+                ),
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(

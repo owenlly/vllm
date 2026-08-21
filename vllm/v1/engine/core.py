@@ -120,6 +120,9 @@ class EngineCore:
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
+        self._external_load_completion_notifications_enabled = (
+            self.model_executor.external_load_completion_notifications_enabled()
+        )
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
@@ -451,6 +454,7 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        self._drain_external_load_completion_notifications()
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -465,11 +469,43 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        # Every successful rank writes its notice before publishing its worker
+        # result.  Once the aggregate future is ready, drain those pipe writes
+        # before ordinary model-step metadata so the direct completion can win
+        # deterministically without changing scheduling order.
+        self._drain_external_load_completion_notifications()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _drain_external_load_completion_notifications(self) -> None:
+        # This branch is cached at initialization so feature-off scheduling
+        # does not call into the executor or allocate temporary stats dicts.
+        if not self._external_load_completion_notifications_enabled:
+            return
+        notices = (
+            self.model_executor.take_external_load_completion_notifications()
+        )
+        stats = (
+            self.model_executor
+            .take_external_load_completion_notification_stats()
+        )
+        if stats:
+            recorder = getattr(
+                self.scheduler,
+                "record_external_load_completion_notify_stats",
+                None,
+            )
+            if callable(recorder):
+                recorder(stats)
+        if notices:
+            notifier = getattr(
+                self.scheduler, "notify_external_load_completions", None
+            )
+            if callable(notifier):
+                notifier(notices)
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -509,6 +545,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            self._drain_external_load_completion_notifications()
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -567,6 +604,7 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        self._drain_external_load_completion_notifications()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -1276,7 +1314,10 @@ class EngineCoreProc(EngineCore):
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            if self._external_load_completion_notifications_enabled:
+                self.model_executor.wait_for_external_load_completion(0.001)
+            else:
+                time.sleep(0.001)
 
         return model_executed
 

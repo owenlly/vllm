@@ -20,6 +20,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -475,6 +476,97 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_free_kv_cache_block_queue_extent_index_is_lazy():
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = FreeKVCacheBlockQueue(blocks)
+
+    assert queue._free_block_ids is None
+    popped = queue.popleft()
+    queue.append(popped)
+
+    assert queue._free_block_ids is None
+    assert [block.block_id for block in queue.get_all_free_blocks()] == [
+        1,
+        2,
+        3,
+        0,
+    ]
+
+
+def test_free_kv_cache_block_queue_selects_extents_in_lru_start_order():
+    blocks = [KVCacheBlock(block_id=i) for i in range(16)]
+    queue_order = [6, 0, 12, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15]
+    queue = FreeKVCacheBlockQueue([blocks[i] for i in queue_order])
+
+    extents = queue.popleft_contiguous_extents(2, 4)
+
+    assert [[block.block_id for block in extent] for extent in extents] == [
+        [6, 7, 8, 9],
+        [0, 1, 2, 3],
+    ]
+    assert [block.block_id for block in queue.get_all_free_blocks()] == [
+        12,
+        4,
+        5,
+        10,
+        11,
+        13,
+        14,
+        15,
+    ]
+
+
+def test_block_pool_contiguous_extent_respects_logical_alignment():
+    pool = BlockPool(
+        num_gpu_blocks=32,
+        enable_caching=False,
+        hash_block_size=16,
+    )
+    pool.enable_contiguous_extent_allocation()
+
+    blocks = pool.get_new_blocks_with_contiguous_extents(
+        num_blocks=23,
+        extent_size=8,
+        logical_start_block=1,
+    )
+    block_ids = [block.block_id for block in blocks]
+
+    assert block_ids[:7] == list(range(1, 8))
+    assert all(
+        current == previous + 1
+        for previous, current in zip(block_ids[7:15], block_ids[8:15])
+    )
+    assert all(
+        current == previous + 1
+        for previous, current in zip(block_ids[15:23], block_ids[16:23])
+    )
+    assert pool.take_contiguous_extent_allocation_stats() == (2, 2)
+    assert pool.take_contiguous_extent_allocation_stats() == (0, 0)
+
+
+def test_block_pool_contiguous_extent_fragmentation_falls_back_immediately():
+    pool = BlockPool(
+        num_gpu_blocks=18,
+        enable_caching=False,
+        hash_block_size=16,
+    )
+    allocated = pool.get_new_blocks(17)
+    fragmented = allocated[::2]
+    pool.free_blocks(fragmented)
+    pool.enable_contiguous_extent_allocation()
+
+    fallback = pool.get_new_blocks_with_contiguous_extents(
+        num_blocks=len(fragmented),
+        extent_size=8,
+        logical_start_block=0,
+    )
+
+    assert [block.block_id for block in fallback] == [
+        block.block_id for block in fragmented
+    ]
+    assert pool.take_contiguous_extent_allocation_stats() == (1, 0)
 
 
 def test_generate_block_hash_extra_keys():

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -129,6 +130,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return set()
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def set_external_load_completion_notifier(
+        self, notifier: Callable[[int, str], bool] | None
+    ) -> bool:
+        if self.connector_worker is None:
+            return False
+        return self.connector_worker.set_external_load_completion_notifier(
+            notifier
+        )
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
@@ -152,6 +162,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def on_external_load_allocation_failure(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_external_load_allocation_failure(request)
+
+    def get_external_load_gpu_block_extent_size(self) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_external_load_gpu_block_extent_size()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
 
     def on_scheduler_iteration_start(self) -> None:
         assert self.connector_scheduler is not None
@@ -182,6 +200,38 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
+
+    def notify_external_load_completion(
+        self, job_id: int, req_id: str, worker_count: int
+    ) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.notify_external_load_completion(
+            job_id, req_id, worker_count
+        )
+
+    def can_accept_external_load_completion(
+        self, job_id: int, req_id: str, worker_count: int
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.can_accept_external_load_completion(
+            job_id, req_id, worker_count
+        )
+
+    def get_external_load_job_req_ids(
+        self, job_ids: Iterable[int]
+    ) -> dict[int, str]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_external_load_job_req_ids(job_ids)
+
+    def record_external_load_completion_notify_stats(
+        self,
+        counters: dict[str, int],
+        latencies: dict[str, list[float]],
+    ) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.record_external_load_completion_notify_stats(
+            counters, latencies
+        )
 
     def request_finished(
         self,

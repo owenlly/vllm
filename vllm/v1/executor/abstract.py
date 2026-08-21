@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -276,6 +276,21 @@ class Executor(ABC):
     def shutdown(self) -> None:
         """Shutdown the executor."""
         self.collective_rpc("shutdown")
+
+    def external_load_completion_notifications_enabled(self) -> bool:
+        return False
+
+    def take_external_load_completion_notifications(self) -> list[Any]:
+        return []
+
+    def take_external_load_completion_notification_stats(self) -> dict[str, int]:
+        return {}
+
+    def wait_for_external_load_completion(self, timeout: float) -> bool:
+        # Preserve the historical idle-yield behavior for executors that do
+        # not support direct completion notifications.
+        time.sleep(timeout)
+        return False
 
     def init_kv_output_aggregator(self, connector: "KVConnectorBase") -> None:
         """Init KVOutputAggregator"""

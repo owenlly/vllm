@@ -534,6 +534,16 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def get_external_load_gpu_block_extent_size(self) -> int | None:
+        """Return the preferred contiguous GPU-block extent for async LOAD.
+
+        The scheduler consults this only after an external lookup has resolved
+        to a non-empty asynchronous LOAD. ``None`` keeps the normal allocator.
+        Connectors must treat the result as best effort: missing extents fall
+        back immediately and never delay admission.
+        """
+        return None
+
     def on_scheduler_iteration_start(self) -> None:
         """Notify the connector that a scheduler iteration has started."""
         return

@@ -23,6 +23,9 @@ TIERING_LOOKUP_STATS_KEY = "tiering_lookup_stats"
 DPU_LOOKUP_STAGE_LATENCY_STATS_KEY = "dpu_lookup_stage_latency_stats"
 PRIMARY_EVICTION_STATS_KEY = "primary_eviction_stats"
 EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY = "external_load_stage_latency_stats"
+EXTERNAL_LOAD_COMPLETION_NOTIFY_STATS_KEY = (
+    "external_load_completion_notify_stats"
+)
 EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY = "external_load_gpu_block_stats"
 EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES = (
     "current_inflight_gpu_blocks",
@@ -30,6 +33,16 @@ EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES = (
     "max_job_gpu_blocks",
     "current_inflight_jobs",
     "peak_inflight_jobs",
+)
+EXTERNAL_LOAD_GPU_EXTENT_STATS_KEY = "external_load_gpu_extent_stats"
+EXTERNAL_LOAD_GPU_EXTENT_STAT_NAMES = (
+    "requested_entries",
+    "allocator_selected_entries",
+    "allocator_fallback_entries",
+    "contiguous_entries",
+    "noncontiguous_entries",
+    "gpu_segments",
+    "gpu_segment_savings",
 )
 FUSED_LOAD_STAGE_LATENCY_STATS_KEY = "fused_load_stage_latency_stats"
 FUSED_STORE_STAGE_LATENCY_STATS_KEY = "fused_store_stage_latency_stats"
@@ -185,8 +198,14 @@ class OffloadingConnectorStats(KVConnectorStats):
                 if k == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_external_load_stage_latency_stats(v)
                     continue
+                if k == EXTERNAL_LOAD_COMPLETION_NOTIFY_STATS_KEY:
+                    self._aggregate_external_load_completion_notify_stats(v)
+                    continue
                 if k == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
                     self._aggregate_external_load_gpu_block_stats(v)
+                    continue
+                if k == EXTERNAL_LOAD_GPU_EXTENT_STATS_KEY:
+                    self._aggregate_external_load_gpu_extent_stats(v)
                     continue
                 if k == FUSED_LOAD_STAGE_LATENCY_STATS_KEY:
                     self._aggregate_fused_load_stage_latency_stats(v)
@@ -307,6 +326,31 @@ class OffloadingConnectorStats(KVConnectorStats):
             assert isinstance(output_latencies, list)
             output_latencies.extend(latencies)
 
+    def _aggregate_external_load_completion_notify_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        counters = stats.get("counters", {})
+        latencies = stats.get("latencies", {})
+        if not isinstance(counters, dict) or not isinstance(latencies, dict):
+            raise ValueError("invalid external LOAD completion notify stats")
+        accumulator = self.data.setdefault(
+            EXTERNAL_LOAD_COMPLETION_NOTIFY_STATS_KEY,
+            {"counters": {}, "latencies": {}},
+        )
+        output_counters = accumulator["counters"]
+        output_latencies = accumulator["latencies"]
+        for name, value in counters.items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid completion notify counter")
+            output_counters[name] = output_counters.get(name, 0) + value
+        for name, samples in latencies.items():
+            if not isinstance(samples, list) or any(
+                not isinstance(value, (int, float)) or value < 0
+                for value in samples
+            ):
+                raise ValueError("invalid completion notify latency")
+            output_latencies.setdefault(name, []).extend(samples)
+
     def _aggregate_external_load_gpu_block_stats(
         self, stats: dict[str, Any]
     ) -> None:
@@ -343,6 +387,20 @@ class OffloadingConnectorStats(KVConnectorStats):
                 accumulator[name] = value
             else:
                 accumulator[name] = max(accumulator.get(name, 0), value)
+
+    def _aggregate_external_load_gpu_extent_stats(
+        self, stats: dict[str, Any]
+    ) -> None:
+        if set(stats) - set(EXTERNAL_LOAD_GPU_EXTENT_STAT_NAMES):
+            raise ValueError("unknown external LOAD GPU extent statistic")
+        accumulator = self.data.setdefault(
+            EXTERNAL_LOAD_GPU_EXTENT_STATS_KEY, {}
+        )
+        assert isinstance(accumulator, dict)
+        for name, value in stats.items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid external LOAD GPU extent statistic")
+            accumulator[name] = accumulator.get(name, 0) + value
 
     def _aggregate_fused_store_stage_latency_stats(
         self, stats: dict[str, Any]
@@ -529,6 +587,20 @@ class OffloadingConnectorStats(KVConnectorStats):
                         f"external_load_{stage}_latency_sum"
                     ] = sum(latencies)
                 continue
+            if transfer_type == EXTERNAL_LOAD_COMPLETION_NOTIFY_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for name, value in ops_list.get("counters", {}).items():
+                    return_dict[
+                        f"external_load_completion_notify_{name}"
+                    ] = value
+                for name, samples in ops_list.get("latencies", {}).items():
+                    return_dict[
+                        f"external_load_completion_notify_{name}_latency_count"
+                    ] = len(samples)
+                    return_dict[
+                        f"external_load_completion_notify_{name}_latency_sum"
+                    ] = sum(samples)
+                continue
             if transfer_type == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
                 assert isinstance(ops_list, dict)
                 job_gpu_blocks = ops_list.get("job_gpu_blocks", [])
@@ -541,6 +613,13 @@ class OffloadingConnectorStats(KVConnectorStats):
                 )
                 for name in EXTERNAL_LOAD_GPU_BLOCK_SNAPSHOT_NAMES:
                     return_dict[f"external_load_gpu_block_{name}"] = (
+                        ops_list.get(name, 0)
+                    )
+                continue
+            if transfer_type == EXTERNAL_LOAD_GPU_EXTENT_STATS_KEY:
+                assert isinstance(ops_list, dict)
+                for name in EXTERNAL_LOAD_GPU_EXTENT_STAT_NAMES:
+                    return_dict[f"external_load_gpu_extent_{name}"] = (
                         ops_list.get(name, 0)
                     )
                 continue
@@ -683,10 +762,26 @@ class OffloadingConnectorStats(KVConnectorStats):
             return
         self._aggregate_external_load_stage_latency_stats(stats)
 
+    def record_external_load_completion_notify_stats(
+        self,
+        counters: dict[str, int],
+        latencies: dict[str, list[float]] | None = None,
+    ) -> None:
+        if counters or latencies:
+            self._aggregate_external_load_completion_notify_stats(
+                {"counters": counters, "latencies": latencies or {}}
+            )
+
     def record_external_load_gpu_block_stats(
         self, stats: dict[str, Any]
     ) -> None:
         self._aggregate_external_load_gpu_block_stats(stats)
+
+    def record_external_load_gpu_extent_stats(
+        self, stats: dict[str, int]
+    ) -> None:
+        if stats:
+            self._aggregate_external_load_gpu_extent_stats(stats)
 
     def record_fused_store_stage_latency_stats(
         self, stats: dict[str, list[float]]
@@ -841,6 +936,12 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.counter_fused_resident: dict[
             tuple[int, str, str], PromMetricT
         ] = {}
+        self.counter_external_load_completion_notify: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
+        self.counter_external_load_gpu_extent: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
         external_load_gpu_block_buckets = list(
             EXTERNAL_LOAD_GPU_BLOCK_BUCKETS
         )
@@ -973,6 +1074,26 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             buckets=latency_buckets[:],
             labelnames=labelnames + ["stage"],
         )
+        self._counter_external_load_completion_notify = self._counter_cls(
+            name="vllm:kv_offload_external_load_completion_notify_total",
+            documentation=(
+                "Direct external LOAD completion notification events."
+            ),
+            labelnames=labelnames + ["stat"],
+        )
+        external_load_gpu_extent_counter = self._counter_cls(
+            name="vllm:kv_offload_external_load_gpu_extent_total",
+            documentation=(
+                "External LOAD GPU extent allocation and resulting "
+                "contiguous segment counters."
+            ),
+            labelnames=labelnames + ["stat"],
+        )
+        for idx, values in per_engine_labelvalues.items():
+            for name in EXTERNAL_LOAD_GPU_EXTENT_STAT_NAMES:
+                self.counter_external_load_gpu_extent[(idx, name)] = (
+                    external_load_gpu_extent_counter.labels(*values, name)
+                )
 
         self._histogram_dpu_lookup_stage_latency = self._histogram_cls(
             name="vllm:kv_offload_dpu_lookup_stage_latency_seconds",
@@ -1223,8 +1344,16 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if transfer_type == EXTERNAL_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_external_load_stage_latency_stats(ops, engine_idx)
                 continue
+            if transfer_type == EXTERNAL_LOAD_COMPLETION_NOTIFY_STATS_KEY:
+                self._observe_external_load_completion_notify_stats(
+                    ops, engine_idx
+                )
+                continue
             if transfer_type == EXTERNAL_LOAD_GPU_BLOCK_STATS_KEY:
                 self._observe_external_load_gpu_block_stats(ops, engine_idx)
+                continue
+            if transfer_type == EXTERNAL_LOAD_GPU_EXTENT_STATS_KEY:
+                self._observe_external_load_gpu_extent_stats(ops, engine_idx)
                 continue
             if transfer_type == FUSED_LOAD_STAGE_LATENCY_STATS_KEY:
                 self._observe_fused_load_stage_latency_stats(ops, engine_idx)
@@ -1381,6 +1510,28 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                     latency_s
                 )
 
+    def _observe_external_load_completion_notify_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        for name, value in stats.get("counters", {}).items():
+            key = (engine_idx, name)
+            if key not in self.counter_external_load_completion_notify:
+                self.counter_external_load_completion_notify[key] = (
+                    self._counter_external_load_completion_notify.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [name])
+                    )
+                )
+            if value:
+                self.counter_external_load_completion_notify[key].inc(value)
+        # Reuse the external LOAD stage histogram with an explicit namespace.
+        self._observe_external_load_stage_latency_stats(
+            {
+                f"completion_notify_{name}": samples
+                for name, samples in stats.get("latencies", {}).items()
+            },
+            engine_idx,
+        )
+
     def _observe_external_load_gpu_block_stats(
         self, stats: dict[str, Any], engine_idx: int
     ) -> None:
@@ -1397,6 +1548,19 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             if not isinstance(value, int) or value < 0:
                 raise ValueError("invalid external LOAD GPU block snapshot")
             self.gauge_external_load_gpu_blocks[(engine_idx, name)].set(value)
+
+    def _observe_external_load_gpu_extent_stats(
+        self, stats: dict[str, Any], engine_idx: int
+    ) -> None:
+        if set(stats) - set(EXTERNAL_LOAD_GPU_EXTENT_STAT_NAMES):
+            raise ValueError("unknown external LOAD GPU extent statistic")
+        for name, value in stats.items():
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("invalid external LOAD GPU extent statistic")
+            if value:
+                self.counter_external_load_gpu_extent[(engine_idx, name)].inc(
+                    value
+                )
 
     def _observe_fused_store_stage_latency_stats(
         self, stats: dict[str, Any], engine_idx: int

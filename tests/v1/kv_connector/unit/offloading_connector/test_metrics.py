@@ -104,6 +104,58 @@ def test_external_load_gpu_block_stats_reject_invalid_values(bad_stats):
         )
 
 
+def test_aggregate_external_load_gpu_extent_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_external_load_gpu_extent_stats(
+        {
+            "requested_entries": 2,
+            "allocator_selected_entries": 1,
+            "allocator_fallback_entries": 1,
+            "contiguous_entries": 1,
+            "noncontiguous_entries": 1,
+            "gpu_segments": 3,
+            "gpu_segment_savings": 13,
+        }
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_external_load_gpu_extent_stats(
+        {
+            "requested_entries": 3,
+            "allocator_selected_entries": 2,
+            "allocator_fallback_entries": 1,
+            "contiguous_entries": 2,
+            "noncontiguous_entries": 1,
+            "gpu_segments": 5,
+            "gpu_segment_savings": 19,
+        }
+    )
+
+    assert stats1.aggregate(stats2).reduce() == {
+        "external_load_gpu_extent_requested_entries": 5,
+        "external_load_gpu_extent_allocator_selected_entries": 3,
+        "external_load_gpu_extent_allocator_fallback_entries": 2,
+        "external_load_gpu_extent_contiguous_entries": 3,
+        "external_load_gpu_extent_noncontiguous_entries": 2,
+        "external_load_gpu_extent_gpu_segments": 8,
+        "external_load_gpu_extent_gpu_segment_savings": 32,
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_stats",
+    [
+        {"requested_entries": -1},
+        {"gpu_segments": 1.5},
+        {"unknown": 1},
+    ],
+)
+def test_external_load_gpu_extent_stats_reject_invalid_values(bad_stats):
+    with pytest.raises(ValueError):
+        OffloadingConnectorStats().record_external_load_gpu_extent_stats(
+            bad_stats
+        )
+
+
 def test_build_kv_connector_stats_with_empty_dict():
     """Test that build_kv_connector_stats returns empty stats with empty dict."""
     stats = OffloadingConnector.build_kv_connector_stats(data={})
@@ -387,6 +439,31 @@ def test_aggregate_external_load_stage_latency_stats():
         )
         < 1e-12
     )
+
+
+def test_aggregate_external_load_completion_notify_stats():
+    stats1 = OffloadingConnectorStats()
+    stats1.record_external_load_completion_notify_stats(
+        {"emitted": 2, "fast_completions": 1},
+        {"rank_aggregate": [0.01]},
+    )
+    stats2 = OffloadingConnectorStats()
+    stats2.record_external_load_completion_notify_stats(
+        {"emitted": 3, "dropped": 1},
+        {"rank_aggregate": [0.02]},
+    )
+
+    reduced = stats1.aggregate(stats2).reduce()
+
+    assert reduced["external_load_completion_notify_emitted"] == 5
+    assert reduced["external_load_completion_notify_dropped"] == 1
+    assert reduced["external_load_completion_notify_fast_completions"] == 1
+    assert reduced[
+        "external_load_completion_notify_rank_aggregate_latency_count"
+    ] == 2
+    assert reduced[
+        "external_load_completion_notify_rank_aggregate_latency_sum"
+    ] == pytest.approx(0.03)
 
 
 def test_aggregate_dpu_lookup_stage_latency_stats():

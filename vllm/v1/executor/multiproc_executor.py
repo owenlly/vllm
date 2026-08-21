@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import multiprocessing
 import os
 import pickle
 import queue
+import secrets
 import signal
 import threading
 import time
 import traceback
 import weakref
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
 from contextlib import suppress
@@ -60,11 +62,45 @@ from vllm.utils.system_utils import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.external_load_completion import (
+    ExternalLoadCompletionNotice,
+)
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+# Connection.send_bytes prefixes a four-byte frame header.  Keeping the whole
+# frame within both this cap and the pipe's runtime PIPE_BUF guarantees that a
+# nonblocking write is atomic: it either publishes one complete notice or
+# fails with EAGAIN without corrupting the stream.
+_EXTERNAL_LOAD_COMPLETION_MAX_PAYLOAD_BYTES = 4092
+# A default Linux pipe is only 64 KiB on gpu-98. At TP4/SWE concurrency a
+# worker can finish hundreds of LOADs between two EngineCore drains, so the
+# deliberately nonblocking notification path otherwise falls back for a large
+# fraction of jobs. One MiB per rank is still bounded (4 MiB for TP4) and
+# keeps the data-path worker nonblocking while absorbing the observed bursts.
+_EXTERNAL_LOAD_COMPLETION_PIPE_BYTES = 1 << 20
+
+
+def _resize_external_load_completion_pipe(connection: Connection) -> int:
+    """Best-effort enlarge a completion pipe and return its actual capacity."""
+    get_pipe_sz = getattr(fcntl, "F_GETPIPE_SZ", None)
+    set_pipe_sz = getattr(fcntl, "F_SETPIPE_SZ", None)
+    if get_pipe_sz is None or set_pipe_sz is None:
+        return 0
+    fd = connection.fileno()
+    try:
+        fcntl.fcntl(fd, set_pipe_sz, _EXTERNAL_LOAD_COMPLETION_PIPE_BYTES)
+    except OSError:
+        # Fail open: ordinary connector metadata remains the authoritative
+        # completion path if the platform forbids growing the pipe.
+        pass
+    try:
+        return int(fcntl.fcntl(fd, get_pipe_sz))
+    except OSError:
+        return 0
 
 
 class FutureWrapper(Future):
@@ -157,6 +193,33 @@ class MultiprocExecutor(Executor):
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         # Create workers
         context = get_mp_context()
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        completion_notify = (
+            False
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "load_completion_notify", False
+            )
+        )
+        if not isinstance(completion_notify, bool):
+            raise ValueError("load_completion_notify must be a boolean")
+        if completion_notify and self.parallel_config.nnodes_within_dp != 1:
+            logger.warning(
+                "Disabling direct external LOAD completion notifications "
+                "for a multi-node executor"
+            )
+            completion_notify = False
+        self._external_load_completion_enabled = completion_notify
+        self._external_load_completion_epoch = (
+            (secrets.randbits(63) or 1) if completion_notify else 0
+        )
+        self._external_load_completion_readers: list[Connection] = []
+        self._external_load_completion_buffer: deque[
+            ExternalLoadCompletionNotice
+        ] = deque()
+        self._external_load_completion_stats: defaultdict[
+            str, int
+        ] = defaultdict(int)
         shared_worker_lock = context.Lock()
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
@@ -176,23 +239,59 @@ class MultiprocExecutor(Executor):
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
+                completion_reader: Connection | None = None
+                completion_writer: Connection | None = None
+                worker_inherited_fds = inherited_fds
+                if self._external_load_completion_enabled:
+                    completion_reader, completion_writer = context.Pipe(
+                        duplex=False
+                    )
+                    pipe_capacity = _resize_external_load_completion_pipe(
+                        completion_reader
+                    )
+                    logger.info_once(
+                        "Direct external LOAD completion pipe capacity: %d "
+                        "bytes per rank",
+                        pipe_capacity,
+                    )
+                    # Register the parent end before spawning so the outer
+                    # initialization-failure cleanup also owns this fd if
+                    # process creation raises.
+                    self._external_load_completion_readers.append(
+                        completion_reader
+                    )
+                    if inherited_fds is not None:
+                        worker_inherited_fds = [
+                            *inherited_fds,
+                            completion_reader.fileno(),
+                        ]
                 with cpu_omp_manager.configure_omp_envs(
                     rank=global_rank, local_rank=local_rank
                 ):
-                    unready_worker_handle = WorkerProc.make_worker_process(
-                        vllm_config=self.vllm_config,
-                        local_rank=local_rank,
-                        rank=global_rank,
-                        distributed_init_method=distributed_init_method,
-                        input_shm_handle=scheduler_output_handle,
-                        shared_worker_lock=shared_worker_lock,
-                        is_driver_worker=is_driver_worker,
-                        inherited_fds=inherited_fds,
-                    )
+                    try:
+                        unready_worker_handle = WorkerProc.make_worker_process(
+                            vllm_config=self.vllm_config,
+                            local_rank=local_rank,
+                            rank=global_rank,
+                            distributed_init_method=distributed_init_method,
+                            input_shm_handle=scheduler_output_handle,
+                            shared_worker_lock=shared_worker_lock,
+                            is_driver_worker=is_driver_worker,
+                            inherited_fds=worker_inherited_fds,
+                            external_load_completion_writer=completion_writer,
+                            external_load_completion_epoch=(
+                                self._external_load_completion_epoch
+                            ),
+                        )
+                    finally:
+                        if completion_writer is not None:
+                            completion_writer.close()
                 unready_workers.append(unready_worker_handle)
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+                    if completion_reader is not None:
+                        inherited_fds.append(completion_reader.fileno())
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -243,6 +342,9 @@ class MultiprocExecutor(Executor):
                         uw.death_writer.close()
                         uw.death_writer = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                for reader in self._external_load_completion_readers:
+                    reader.close()
+                self._external_load_completion_readers.clear()
 
         self.output_rank = self._get_output_rank()
 
@@ -403,6 +505,100 @@ class MultiprocExecutor(Executor):
 
         return future if non_block else future.result()
 
+    def external_load_completion_notifications_enabled(self) -> bool:
+        return self._external_load_completion_enabled
+
+    def _accept_external_load_completion_notice(self, value: Any) -> None:
+        if not isinstance(value, ExternalLoadCompletionNotice):
+            self._external_load_completion_stats["invalid"] += 1
+            return
+        if value.epoch != self._external_load_completion_epoch:
+            self._external_load_completion_stats["stale_epoch"] += 1
+            return
+        if (
+            value.rank < 0
+            or value.job_id < 0
+            or not value.req_id
+            or value.completed_at_s < 0.0
+        ):
+            self._external_load_completion_stats["invalid"] += 1
+            return
+        self._external_load_completion_buffer.append(value)
+        self._external_load_completion_stats["received"] += 1
+
+    def _drain_external_load_completion_pipes(
+        self, timeout: float = 0.0
+    ) -> bool:
+        if not self._external_load_completion_enabled:
+            return False
+        readers = self._external_load_completion_readers
+        if not readers:
+            self._external_load_completion_enabled = False
+            if timeout > 0.0:
+                time.sleep(timeout)
+            return False
+        try:
+            ready = multiprocessing.connection.wait(readers, timeout=timeout)
+        except (OSError, ValueError):
+            self._external_load_completion_stats["pipe_wait_errors"] += 1
+            return False
+        received = False
+        for reader in ready:
+            while True:
+                try:
+                    if not reader.poll():
+                        break
+                    payload = reader.recv_bytes(
+                        _EXTERNAL_LOAD_COMPLETION_MAX_PAYLOAD_BYTES
+                    )
+                    self._accept_external_load_completion_notice(
+                        pickle.loads(payload)
+                    )
+                    received = True
+                except EOFError:
+                    self._external_load_completion_stats[
+                        "pipe_disconnected"
+                    ] += 1
+                    with suppress(ValueError):
+                        readers.remove(reader)
+                    reader.close()
+                    if not readers:
+                        self._external_load_completion_enabled = False
+                    break
+                except (OSError, ValueError, pickle.PickleError):
+                    self._external_load_completion_stats[
+                        "pipe_receive_errors"
+                    ] += 1
+                    with suppress(ValueError):
+                        readers.remove(reader)
+                    reader.close()
+                    if not readers:
+                        self._external_load_completion_enabled = False
+                    break
+        return received
+
+    def take_external_load_completion_notifications(
+        self,
+    ) -> list[ExternalLoadCompletionNotice]:
+        if not self._external_load_completion_enabled:
+            return []
+        self._drain_external_load_completion_pipes()
+        notices = list(self._external_load_completion_buffer)
+        self._external_load_completion_buffer.clear()
+        return notices
+
+    def take_external_load_completion_notification_stats(self) -> dict[str, int]:
+        if not self._external_load_completion_enabled:
+            return {}
+        stats = dict(self._external_load_completion_stats)
+        self._external_load_completion_stats.clear()
+        return stats
+
+    def wait_for_external_load_completion(self, timeout: float) -> bool:
+        if not self._external_load_completion_enabled:
+            return super().wait_for_external_load_completion(timeout)
+        return self._drain_external_load_completion_pipes(timeout)
+
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
         """Ensure that all worker processes are terminated. Assumes workers have
@@ -477,6 +673,14 @@ class MultiprocExecutor(Executor):
                     if w.worker_response_mq is not None:
                         w.worker_response_mq.shutdown()
                         w.worker_response_mq = None
+
+            self._external_load_completion_epoch = 0
+            for reader in getattr(
+                self, "_external_load_completion_readers", ()
+            ):
+                reader.close()
+            self._external_load_completion_readers = []
+            self._external_load_completion_buffer.clear()
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
@@ -600,8 +804,28 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        external_load_completion_writer: Connection | None = None,
+        external_load_completion_epoch: int = 0,
     ):
         self.rank = rank
+        self._external_load_completion_writer = (
+            external_load_completion_writer
+        )
+        self._external_load_completion_epoch = external_load_completion_epoch
+        self._external_load_completion_notifier_installed = False
+        if external_load_completion_writer is not None:
+            writer_fd = external_load_completion_writer.fileno()
+            os.set_blocking(writer_fd, False)
+            try:
+                pipe_buf = int(os.fpathconf(writer_fd, "PC_PIPE_BUF"))
+            except (OSError, ValueError):
+                pipe_buf = 512
+            self._external_load_completion_max_payload_bytes = min(
+                _EXTERNAL_LOAD_COMPLETION_MAX_PAYLOAD_BYTES,
+                max(pipe_buf - 4, 0),
+            )
+        else:
+            self._external_load_completion_max_payload_bytes = 0
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -665,6 +889,8 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
+        external_load_completion_writer: Connection | None = None,
+        external_load_completion_epoch: int = 0,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
@@ -684,6 +910,12 @@ class WorkerProc:
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
+            "external_load_completion_writer": (
+                external_load_completion_writer
+            ),
+            "external_load_completion_epoch": (
+                external_load_completion_epoch
+            ),
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
@@ -773,6 +1005,9 @@ class WorkerProc:
         if self.worker_response_mq is not None:
             self.worker_response_mq.shutdown()
         self.worker.shutdown()
+        if self._external_load_completion_writer is not None:
+            self._external_load_completion_writer.close()
+            self._external_load_completion_writer = None
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
         destroy_model_parallel()
@@ -980,6 +1215,8 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+                if method == "initialize_from_config":
+                    self._install_external_load_completion_notifier()
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
@@ -993,6 +1230,72 @@ class WorkerProc:
 
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(output)
+
+    def _install_external_load_completion_notifier(self) -> None:
+        if (
+            self._external_load_completion_writer is None
+            or self._external_load_completion_notifier_installed
+        ):
+            return
+        try:
+            from vllm.distributed.kv_transfer import (
+                get_kv_transfer_group,
+                has_kv_transfer_group,
+            )
+
+            if not has_kv_transfer_group():
+                return
+            connector = get_kv_transfer_group()
+            setter = getattr(
+                connector, "set_external_load_completion_notifier", None
+            )
+            if not callable(setter) or not setter(
+                self._emit_external_load_completion_notice
+            ):
+                logger.warning(
+                    "KV connector does not support direct external LOAD "
+                    "completion notifications"
+                )
+                return
+            self._external_load_completion_notifier_installed = True
+        except Exception:
+            # Fail open: ordinary per-step connector metadata remains active.
+            logger.exception(
+                "Failed to install external LOAD completion notifier"
+            )
+
+    def _emit_external_load_completion_notice(
+        self, job_id: int, req_id: str
+    ) -> bool:
+        writer = self._external_load_completion_writer
+        if writer is None:
+            return False
+        notice = ExternalLoadCompletionNotice(
+            self._external_load_completion_epoch,
+            self.rank,
+            job_id,
+            req_id,
+            time.monotonic(),
+        )
+        payload = pickle.dumps(notice, protocol=pickle.HIGHEST_PROTOCOL)
+        if (
+            not self._external_load_completion_max_payload_bytes
+            or len(payload)
+            > self._external_load_completion_max_payload_bytes
+        ):
+            return False
+        try:
+            # The descriptor is O_NONBLOCK. CPython's Connection sends a small
+            # frame (four-byte header + payload) with one os.write(). Since the
+            # complete frame fits in PIPE_BUF, concurrent completion threads
+            # publish atomically without a user-space lock: each write either
+            # succeeds in full or fails immediately with EAGAIN. A try-lock
+            # here would incorrectly drop one of two simultaneous rank-local
+            # LOAD completions even when the pipe has ample capacity.
+            writer.send_bytes(payload)
+            return True
+        except (BlockingIOError, BrokenPipeError, EOFError, OSError, ValueError):
+            return False
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

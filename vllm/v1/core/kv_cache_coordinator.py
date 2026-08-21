@@ -189,6 +189,7 @@ class KVCacheCoordinator(ABC):
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        external_load_gpu_block_extent_size: int | None = None,
     ) -> None:
         """
         Add the new computed blocks to the request. Optionally allocate new
@@ -200,6 +201,8 @@ class KVCacheCoordinator(ABC):
                 prefix cache.
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
+            external_load_gpu_block_extent_size: Best-effort contiguous GPU-block
+                extent for complete external offload entries.
         """
         for i, manager in enumerate(self.single_type_managers):
             manager.allocate_new_computed_blocks(
@@ -207,6 +210,7 @@ class KVCacheCoordinator(ABC):
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
+                external_load_gpu_block_extent_size,
             )
 
     def allocate_new_blocks(

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
@@ -48,6 +50,11 @@ class OffloadingConnectorWorker:
         self.kv_connector_stats = OffloadingConnectorStats()
         # job_id -> (req_id, destination GPU block IDs) for in-flight loads.
         self._load_jobs: dict[int, tuple[ReqId, tuple[int, ...]]] = {}
+        self._load_jobs_lock = threading.Lock()
+        self._external_load_completion_notifier: (
+            Callable[[int, str], bool] | None
+        ) = None
+        self._completion_notify_stats: dict[str, int] = defaultdict(int)
         self._invalid_load_block_ids: set[int] = set()
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
@@ -55,6 +62,39 @@ class OffloadingConnectorWorker:
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
             self.worker.register_handler(src_cls, dst_cls, handler)
+
+    def set_external_load_completion_notifier(
+        self, notifier: Callable[[int, str], bool] | None
+    ) -> bool:
+        """Install a non-owning successful LOAD completion hint sink."""
+        installed = False
+        for handler in self.worker.handlers:
+            setter = getattr(
+                handler, "set_successful_load_completion_callback", None
+            )
+            if callable(setter) and setter(
+                self._on_successful_load_completion if notifier is not None else None
+            ):
+                installed = True
+        with self._load_jobs_lock:
+            self._external_load_completion_notifier = notifier if installed else None
+        return installed
+
+    def _on_successful_load_completion(self, job_id: int) -> None:
+        with self._load_jobs_lock:
+            load = self._load_jobs.get(job_id)
+            notifier = self._external_load_completion_notifier
+        if load is None or notifier is None:
+            return
+        emitted = False
+        try:
+            emitted = notifier(job_id, load[0])
+        except Exception:
+            logger.exception("external LOAD completion notifier failed")
+        with self._load_jobs_lock:
+            self._completion_notify_stats[
+                "emitted" if emitted else "dropped"
+            ] += 1
 
     def register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
@@ -250,10 +290,15 @@ class OffloadingConnectorWorker:
             dst_spec = entry.transfer_spec[1]
             if not isinstance(dst_spec, GPULoadStoreSpec):
                 raise TypeError("LOAD destination must be GPU block metadata")
-            self._load_jobs[job_id] = (
+            load = (
                 entry.req_id,
                 tuple(int(block_id) for block_id in dst_spec.block_ids),
             )
+            if getattr(self, "_external_load_completion_notifier", None) is None:
+                self._load_jobs[job_id] = load
+            else:
+                with self._load_jobs_lock:
+                    self._load_jobs[job_id] = load
             success = self.worker.transfer_async(job_id, entry.transfer_spec)
             assert success
 
@@ -340,7 +385,11 @@ class OffloadingConnectorWorker:
             self._connector_worker_meta.mark_completed(job_id)
             if not transfer_result.success:
                 self._connector_worker_meta.mark_failed(job_id)
-            load = self._load_jobs.pop(job_id, None)
+            if getattr(self, "_external_load_completion_notifier", None) is None:
+                load = self._load_jobs.pop(job_id, None)
+            else:
+                with self._load_jobs_lock:
+                    load = self._load_jobs.pop(job_id, None)
             if load is not None:
                 req_id, gpu_block_ids = load
                 if not transfer_result.success:
@@ -370,6 +419,13 @@ class OffloadingConnectorWorker:
         Get the KV transfer stats for the connector.
         """
 
+        if getattr(self, "_external_load_completion_notifier", None) is not None:
+            with self._load_jobs_lock:
+                notify_stats = dict(self._completion_notify_stats)
+                self._completion_notify_stats.clear()
+            self.kv_connector_stats.record_external_load_completion_notify_stats(
+                notify_stats
+            )
         if self.kv_connector_stats.is_empty():
             return None
         # Clear stats for next iteration
@@ -379,7 +435,13 @@ class OffloadingConnectorWorker:
 
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
-        self._load_jobs.clear()
+        if getattr(self, "_external_load_completion_notifier", None) is None:
+            self._load_jobs.clear()
+        else:
+            with self._load_jobs_lock:
+                self._external_load_completion_notifier = None
+                self._load_jobs.clear()
+                self._completion_notify_stats.clear()
         self._invalid_load_block_ids.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self.worker.shutdown()

@@ -50,6 +50,9 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.executor.external_load_completion import (
+    ExternalLoadCompletionNotice,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -180,6 +183,29 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        direct_load_completion = (
+            False
+            if kv_transfer_config is None
+            else kv_transfer_config.get_from_extra_config(
+                "load_completion_notify", False
+            )
+        )
+        if not isinstance(direct_load_completion, bool):
+            raise ValueError("load_completion_notify must be a boolean")
+        self._direct_external_load_completion_enabled = (
+            direct_load_completion
+        )
+        # Rank hints are provisional until all expected ranks arrive. Direct
+        # completions retain a job-aware tombstone until ordinary worker
+        # metadata is consumed, preventing duplicate lifecycle actions while
+        # allowing a later LOAD that reuses the same request ID.
+        self._external_load_completion_ranks: dict[
+            int, tuple[str, set[int], float]
+        ] = {}
+        self._direct_external_load_completed_jobs: dict[
+            int, tuple[str, int]
+        ] = {}
         # DPU-owned lookup completions are edge-triggered by the connector.
         # Keep the hint until the request is actually revisited. Otherwise a
         # transient scheduling constraint can consume the edge, requeue the
@@ -1018,6 +1044,11 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
+                    external_load_gpu_block_extent_size=(
+                        self.connector.get_external_load_gpu_block_extent_size()
+                        if load_kv_async and self.connector is not None
+                        else None
+                    ),
                 )
 
                 if new_blocks is None:
@@ -2430,6 +2461,8 @@ class Scheduler(SchedulerInterface):
         if self.connector.reset_cache() is False:
             return False
 
+        self._external_load_completion_ranks.clear()
+
         if self.log_stats:
             assert self.connector_prefix_cache_stats is not None
             self.connector_prefix_cache_stats.reset = True
@@ -2705,12 +2738,139 @@ class Scheduler(SchedulerInterface):
             schedule the request during the next step.
         """
 
+        # Preserve the original connector path exactly when the optional
+        # direct-completion feature is disabled.
+        if not getattr(
+            self, "_direct_external_load_completion_enabled", False
+        ):
+            if self.connector is not None:
+                self.connector.update_connector_output(kv_connector_output)
+            for req_id in kv_connector_output.finished_recving or ():
+                logger.debug(
+                    "Finished recving KV transfer for request %s", req_id
+                )
+                assert req_id in self.requests
+                req = self.requests[req_id]
+                if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    self.finished_recving_kv_req_ids.add(req_id)
+                else:
+                    assert RequestStatus.is_finished(req.status)
+                    self._free_blocks(req)
+            for req_id in kv_connector_output.finished_sending or ():
+                logger.debug(
+                    "Finished sending KV transfer for request %s", req_id
+                )
+                assert req_id in self.requests
+                self._free_blocks(self.requests[req_id])
+            return
+
+        completed_jobs = getattr(
+            kv_connector_output.kv_connector_worker_meta,
+            "completed_jobs",
+            {},
+        )
+        ordinary_job_req_ids: dict[int, str] = {}
+        if self.connector is not None:
+            resolver = getattr(
+                self.connector, "get_external_load_job_req_ids", None
+            )
+            if callable(resolver):
+                ordinary_job_req_ids = resolver(completed_jobs.keys())
+
+        direct_job_ids = set(self._direct_external_load_completed_jobs)
+        for job_id, count in completed_jobs.items():
+            tombstone = self._direct_external_load_completed_jobs.get(job_id)
+            if tombstone is None:
+                continue
+            req_id, remaining = tombstone
+            self._direct_external_load_completed_jobs[job_id] = (
+                req_id,
+                max(remaining - count, 0),
+            )
+
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
+        # A req-only finished_recving signal can combine rank records from an
+        # old direct-completed job with a newer LOAD for the same request.
+        # Only let that signal represent the newer job if the job-aware
+        # connector metadata actually finalized it in this update.  A partial
+        # newer job remains resolvable in the connector and must keep waiting.
+        ordinary_job_ids = {
+            job_id
+            for job_id in ordinary_job_req_ids
+            if job_id not in direct_job_ids
+        }
+        remaining_ordinary_job_ids: set[int] = set()
+        if ordinary_job_ids and self.connector is not None:
+            resolver = getattr(
+                self.connector, "get_external_load_job_req_ids", None
+            )
+            if callable(resolver):
+                remaining_ordinary_job_ids = set(resolver(ordinary_job_ids))
+
+        # A model step may observe ordinary completion metadata for only a
+        # subset of TP ranks.  Keep successful direct notices accumulated for
+        # that still-active LOAD so later rank notices can complete the 4-rank
+        # proof.  Drop an aggregate only after ordinary metadata has finalized
+        # the job (or after the direct path has already installed a tombstone).
+        for job_id in completed_jobs:
+            if (
+                job_id in direct_job_ids
+                or job_id not in remaining_ordinary_job_ids
+            ):
+                self._external_load_completion_ranks.pop(job_id, None)
+        ordinary_completed_load_req_ids = {
+            req_id
+            for job_id, req_id in ordinary_job_req_ids.items()
+            if job_id in ordinary_job_ids
+            and job_id not in remaining_ordinary_job_ids
+        }
+        ordinary_pending_load_req_ids = {
+            req_id
+            for job_id, req_id in ordinary_job_req_ids.items()
+            if job_id in remaining_ordinary_job_ids
+        }
+
+        # Offloading completed_jobs is job-aware, whereas the generic
+        # finished_recving aggregator is keyed only by request ID.  Include
+        # jobs that actually disappeared from the connector here so a reused
+        # request ID cannot lose its later completion when old/new rank
+        # records overlap in the generic aggregator.
+        finished_recving_req_ids = set(
+            kv_connector_output.finished_recving or ()
+        )
+        finished_recving_req_ids.update(ordinary_completed_load_req_ids)
+
         # KV Connector:: update recv and send status from last step.
-        for req_id in kv_connector_output.finished_recving or ():
+        for req_id in finished_recving_req_ids:
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            direct_jobs = [
+                job_id
+                for job_id, (direct_req_id, _) in (
+                    self._direct_external_load_completed_jobs.items()
+                )
+                if direct_req_id == req_id
+            ]
+            if direct_jobs:
+                for job_id in direct_jobs:
+                    _, remaining = self._direct_external_load_completed_jobs[
+                        job_id
+                    ]
+                    if remaining == 0:
+                        del self._direct_external_load_completed_jobs[job_id]
+                if req_id not in ordinary_completed_load_req_ids:
+                    # The direct path already made the request ready or freed
+                    # it. Keep ordinary metadata for metrics only.
+                    continue
+            if (
+                req_id in ordinary_pending_load_req_ids
+                and req_id not in ordinary_completed_load_req_ids
+            ):
+                # The generic req-only aggregator can be offset by late ranks
+                # from an older LOAD.  Never let it finish an active job whose
+                # job-aware completion count is still partial.
+                continue
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -2722,6 +2882,93 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+
+    def notify_external_load_completions(
+        self, notices: Iterable[ExternalLoadCompletionNotice]
+    ) -> None:
+        connector = self.connector
+        if connector is None:
+            return
+        can_accept = getattr(
+            connector, "can_accept_external_load_completion", None
+        )
+        complete = getattr(connector, "notify_external_load_completion", None)
+        record_stats = getattr(
+            connector, "record_external_load_completion_notify_stats", None
+        )
+        if not callable(can_accept) or not callable(complete):
+            return
+
+        expected = self.parallel_config.world_size
+        now = time.monotonic()
+        counters: defaultdict[str, int] = defaultdict(int)
+        latencies: defaultdict[str, list[float]] = defaultdict(list)
+        for notice in notices:
+            if not 0 <= notice.rank < expected:
+                counters["invalid_rank"] += 1
+                continue
+            if not can_accept(notice.job_id, notice.req_id, expected):
+                self._external_load_completion_ranks.pop(notice.job_id, None)
+                counters["stale_or_ordinary_won"] += 1
+                continue
+            request = self.requests.get(notice.req_id)
+            if request is None:
+                self._external_load_completion_ranks.pop(notice.job_id, None)
+                counters["cancelled_or_missing"] += 1
+                continue
+            aggregate = self._external_load_completion_ranks.get(notice.job_id)
+            if aggregate is None:
+                aggregate = (notice.req_id, set(), now)
+                self._external_load_completion_ranks[notice.job_id] = aggregate
+            aggregate_req_id, ranks, first_seen_at_s = aggregate
+            if aggregate_req_id != notice.req_id:
+                self._external_load_completion_ranks.pop(notice.job_id, None)
+                counters["request_mismatch"] += 1
+                continue
+            if notice.rank in ranks:
+                counters["duplicate_rank"] += 1
+                continue
+            ranks.add(notice.rank)
+            counters["rank_notices"] += 1
+            latencies["pipe_to_scheduler"].append(
+                max(now - notice.completed_at_s, 0.0)
+            )
+            if len(ranks) != expected:
+                continue
+            self._external_load_completion_ranks.pop(notice.job_id, None)
+            latencies["rank_aggregate"].append(
+                max(now - first_seen_at_s, 0.0)
+            )
+            remaining_normal = complete(
+                notice.job_id, notice.req_id, expected
+            )
+            if remaining_normal is None:
+                counters["completion_rejected"] += 1
+                continue
+            self._direct_external_load_completed_jobs[notice.job_id] = (
+                notice.req_id,
+                remaining_normal,
+            )
+            counters["fast_completions"] += 1
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                self.finished_recving_kv_req_ids.add(notice.req_id)
+            elif RequestStatus.is_finished(request.status):
+                self._free_blocks(request)
+
+        if callable(record_stats) and (counters or latencies):
+            record_stats(dict(counters), dict(latencies))
+
+    def record_external_load_completion_notify_stats(
+        self, stats: dict[str, int]
+    ) -> None:
+        connector = self.connector
+        if connector is None or not stats:
+            return
+        recorder = getattr(
+            connector, "record_external_load_completion_notify_stats", None
+        )
+        if callable(recorder):
+            recorder(stats, {})
 
     def _update_requests_with_invalid_blocks(
         self,

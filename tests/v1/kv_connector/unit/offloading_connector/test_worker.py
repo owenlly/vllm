@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections import defaultdict
 from unittest.mock import MagicMock
 
@@ -119,10 +120,37 @@ def _make_completion_only_worker():
     worker.worker = MagicMock()
     worker.kv_connector_stats = MagicMock()
     worker._load_jobs = {}
+    worker._load_jobs_lock = threading.Lock()
+    worker._external_load_completion_notifier = None
+    worker._completion_notify_stats = defaultdict(int)
     worker._invalid_load_block_ids = set()
     worker._unsubmitted_store_jobs = []
     worker._connector_worker_meta = OffloadingWorkerMetadata()
     return worker
+
+
+def test_success_completion_hint_is_non_owning_and_counts_delivery():
+    worker = _make_completion_only_worker()
+    notifier = MagicMock(return_value=True)
+    worker._external_load_completion_notifier = notifier
+    worker._load_jobs[17] = ("request-17", (11, 12))
+
+    worker._on_successful_load_completion(17)
+
+    notifier.assert_called_once_with(17, "request-17")
+    assert worker._load_jobs[17] == ("request-17", (11, 12))
+    assert worker._completion_notify_stats == {"emitted": 1}
+
+
+def test_success_completion_hint_drop_is_fail_open():
+    worker = _make_completion_only_worker()
+    worker._external_load_completion_notifier = MagicMock(return_value=False)
+    worker._load_jobs[23] = ("request-23", ())
+
+    worker._on_successful_load_completion(23)
+
+    assert worker._load_jobs[23] == ("request-23", ())
+    assert worker._completion_notify_stats == {"dropped": 1}
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.executor.external_load_completion import (
+    ExternalLoadCompletionNotice,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -176,6 +179,125 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     assert isinstance(event, BlockRemoved)
     assert event.block_hashes == to_hashes([4, 5, 6])
     assert event.medium == "B"
+
+
+def _fragment_oldest_gpu_blocks(runner):
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+    held_blocks = block_pool.get_new_blocks(16)
+    block_pool.free_blocks(held_blocks[::2], prepend=True)
+    return block_pool
+
+
+def test_external_load_contiguous_allocation_default_off_has_no_index(
+    request_runner,
+):
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=80,
+        async_scheduling=True,
+        block_size_factor=8,
+    )
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+
+    assert block_pool.free_block_queue._free_block_ids is None
+    assert runner.connector_scheduler.get_external_load_gpu_block_extent_size() is None
+
+
+def test_confirmed_async_external_load_uses_contiguous_gpu_extent(
+    request_runner,
+):
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=80,
+        async_scheduling=True,
+        block_size_factor=8,
+        extra_config_overrides={
+            "external_load_contiguous_allocation": True
+        },
+    )
+    block_pool = _fragment_oldest_gpu_blocks(runner)
+    runner.new_request(token_ids=[0] * 128)
+    runner.connector_scheduler._maximal_prefix_lookup = (
+        lambda keys, req_context: 1
+    )
+
+    runner.scheduler.schedule()
+
+    manager = (
+        runner.scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    )
+    block_ids = [
+        block.block_id for block in manager.req_to_blocks["0"]
+    ]
+    assert block_ids == list(range(17, 25))
+    assert block_pool.take_contiguous_extent_allocation_stats() == (0, 0)
+    assert dict(runner.connector_scheduler._external_load_gpu_extent_stats) == {
+        "requested_entries": 1,
+        "allocator_selected_entries": 1,
+        "allocator_fallback_entries": 0,
+        "contiguous_entries": 1,
+        "noncontiguous_entries": 0,
+        "gpu_segments": 1,
+        "gpu_segment_savings": 7,
+    }
+
+
+def test_ordinary_request_keeps_normal_gpu_allocator(request_runner):
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=80,
+        async_scheduling=True,
+        block_size_factor=8,
+        extra_config_overrides={
+            "external_load_contiguous_allocation": True
+        },
+    )
+    block_pool = _fragment_oldest_gpu_blocks(runner)
+    runner.new_request(token_ids=[0] * 128)
+    runner.connector_scheduler._maximal_prefix_lookup = (
+        lambda keys, req_context: 0
+    )
+
+    runner.scheduler.schedule()
+
+    manager = (
+        runner.scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    )
+    assert [
+        block.block_id for block in manager.req_to_blocks["0"]
+    ] == list(range(1, 16, 2))
+    assert block_pool.take_contiguous_extent_allocation_stats() == (0, 0)
+    assert not runner.connector_scheduler._external_load_gpu_extent_stats
+
+
+def test_pending_external_lookup_does_not_preallocate_gpu_extents(
+    request_runner,
+):
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=80,
+        async_scheduling=True,
+        block_size_factor=8,
+        extra_config_overrides={
+            "external_load_contiguous_allocation": True
+        },
+    )
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+    free_before = block_pool.get_num_free_blocks()
+    runner.new_request(token_ids=[0] * 128)
+    runner.connector_scheduler._maximal_prefix_lookup = (
+        lambda keys, req_context: None
+    )
+
+    runner.scheduler.schedule()
+
+    manager = (
+        runner.scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    )
+    assert "0" not in manager.req_to_blocks
+    assert block_pool.get_num_free_blocks() == free_before
+    assert block_pool.take_contiguous_extent_allocation_stats() == (0, 0)
+    assert not runner.connector_scheduler._external_load_gpu_extent_stats
 
 
 def test_external_load_stage_latency_tracks_request_critical_path():
@@ -516,6 +638,391 @@ def test_external_load_completion_records_ready_exactly_once():
     )
 
 
+def test_offloading_direct_and_normal_completion_finalize_once():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    request = MagicMock()
+    request.is_finished.return_value = False
+    req_status = SimpleNamespace(
+        req=request,
+        req_context=MagicMock(),
+        transfer_jobs={7},
+        external_load_ready_recorded=False,
+    )
+    scheduler.config = SimpleNamespace(num_workers=1)
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {
+        7: TransferJobStatus(
+            req_id="request-0",
+            pending_count=1,
+            keys=set(),
+            is_store=False,
+            load_gpu_block_count=32,
+        )
+    }
+    scheduler._req_status = {"request-0": req_status}
+    scheduler.manager = MagicMock()
+    scheduler._record_load_gpu_ready = MagicMock()
+    scheduler._blocks_being_loaded = set()
+    scheduler._block_id_to_pending_jobs = {}
+    scheduler._finish_external_load_gpu_block_tracking = MagicMock()
+    scheduler._direct_load_duplicate_counts = {}
+    scheduler._completion_notify_counters = defaultdict(int)
+    scheduler._completion_notify_latencies = defaultdict(list)
+
+    assert scheduler.notify_external_load_completion(7, "request-0", 1) == 1
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 1}
+            )
+        )
+    )
+
+    scheduler.manager.complete_load.assert_called_once()
+    request.record_event.assert_called_once_with(
+        EngineCoreEventType.EXTERNAL_LOAD_READY
+    )
+    scheduler._finish_external_load_gpu_block_tracking.assert_called_once_with(
+        32
+    )
+    assert scheduler._direct_load_duplicate_counts == {}
+
+
+def _make_direct_completion_scheduler(
+    status: RequestStatus = RequestStatus.WAITING_FOR_REMOTE_KVS,
+):
+    scheduler = object.__new__(Scheduler)
+    connector = MagicMock()
+    connector.can_accept_external_load_completion.return_value = True
+    connector.notify_external_load_completion.return_value = 4
+    connector.get_external_load_job_req_ids.return_value = {}
+    scheduler.connector = connector
+    scheduler._direct_external_load_completion_enabled = True
+    scheduler.parallel_config = SimpleNamespace(world_size=4)
+    request = SimpleNamespace(request_id="request-0", status=status)
+    scheduler.requests = {request.request_id: request}
+    scheduler.finished_recving_kv_req_ids = set()
+    scheduler._external_load_completion_ranks = {}
+    scheduler._direct_external_load_completed_jobs = {}
+    scheduler._free_blocks = MagicMock()
+    return scheduler, connector, request
+
+
+def _notices(job_id: int = 7, req_id: str = "request-0"):
+    return [
+        ExternalLoadCompletionNotice(1, rank, job_id, req_id, 1.0)
+        for rank in range(4)
+    ]
+
+
+def test_direct_external_load_requires_four_unique_ranks():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler.notify_external_load_completions(
+        [_notices()[0], _notices()[0], *_notices()[1:]]
+    )
+
+    connector.notify_external_load_completion.assert_called_once_with(
+        7, "request-0", 4
+    )
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+    assert scheduler._direct_external_load_completed_jobs == {
+        7: ("request-0", 4)
+    }
+
+
+def test_direct_completion_disabled_preserves_original_update_path():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler._direct_external_load_completion_enabled = False
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_recving={"request-0"})
+    )
+
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+    connector.update_connector_output.assert_called_once()
+    connector.get_external_load_job_req_ids.assert_not_called()
+
+
+def test_direct_external_load_tracks_only_remaining_normal_records():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    connector.notify_external_load_completion.return_value = 2
+
+    scheduler.notify_external_load_completions(_notices())
+
+    assert scheduler._direct_external_load_completed_jobs == {
+        7: ("request-0", 2)
+    }
+
+
+def test_partial_ordinary_metadata_keeps_direct_rank_aggregate():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    connector.get_external_load_job_req_ids.side_effect = [
+        {7: "request-0"},
+        {7: "request-0"},
+    ]
+    connector.notify_external_load_completion.return_value = 3
+
+    scheduler.notify_external_load_completions(_notices()[:2])
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 1}
+            )
+        )
+    )
+
+    assert scheduler._external_load_completion_ranks[7][1] == {0, 1}
+
+    scheduler.notify_external_load_completions(_notices()[2:])
+
+    connector.notify_external_load_completion.assert_called_once_with(
+        7, "request-0", 4
+    )
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+    assert scheduler._direct_external_load_completed_jobs == {
+        7: ("request-0", 3)
+    }
+
+
+def test_direct_completion_finishes_only_remaining_ordinary_rank_records():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    request = MagicMock()
+    request.is_finished.return_value = False
+    req_status = SimpleNamespace(
+        req=request,
+        req_context=MagicMock(),
+        transfer_jobs={7},
+        external_load_ready_recorded=False,
+    )
+    scheduler.config = SimpleNamespace(num_workers=4)
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {
+        7: TransferJobStatus(
+            req_id="request-0",
+            pending_count=2,
+            keys=set(),
+            is_store=False,
+            load_gpu_block_count=32,
+        )
+    }
+    scheduler._req_status = {"request-0": req_status}
+    scheduler.manager = MagicMock()
+    scheduler._record_load_gpu_ready = MagicMock()
+    scheduler._blocks_being_loaded = set()
+    scheduler._block_id_to_pending_jobs = {}
+    scheduler._finish_external_load_gpu_block_tracking = MagicMock()
+    scheduler._direct_load_duplicate_counts = {}
+    scheduler._completion_notify_counters = defaultdict(int)
+    scheduler._completion_notify_latencies = defaultdict(list)
+
+    assert scheduler.notify_external_load_completion(7, "request-0", 4) == 2
+    assert scheduler._direct_load_duplicate_counts == {7: 2}
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 2}
+            )
+        )
+    )
+
+    scheduler.manager.complete_load.assert_called_once()
+    assert scheduler._direct_load_duplicate_counts == {}
+
+
+def test_direct_then_normal_metadata_does_not_repeat_lifecycle():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler.notify_external_load_completions(_notices())
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 4}
+            ),
+        )
+    )
+
+    scheduler._free_blocks.assert_not_called()
+    assert scheduler._direct_external_load_completed_jobs == {}
+    connector.update_connector_output.assert_called_once()
+
+
+def test_cancelled_direct_then_normal_frees_exactly_once():
+    scheduler, _, _ = _make_direct_completion_scheduler(
+        RequestStatus.FINISHED_ABORTED
+    )
+    scheduler.notify_external_load_completions(_notices())
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 4}
+            ),
+        )
+    )
+
+    scheduler._free_blocks.assert_called_once()
+
+
+def test_cancel_before_four_ranks_discards_partial_aggregate():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler.notify_external_load_completions(_notices()[:2])
+    del scheduler.requests["request-0"]
+
+    scheduler.notify_external_load_completions(_notices()[2:])
+
+    assert scheduler._external_load_completion_ranks == {}
+    connector.notify_external_load_completion.assert_not_called()
+
+
+def test_ordinary_metadata_wins_then_late_rank_does_not_repopulate():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    connector.get_external_load_job_req_ids.return_value = {7: "request-0"}
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 4}
+            ),
+        )
+    )
+    connector.can_accept_external_load_completion.return_value = False
+
+    scheduler.notify_external_load_completions([_notices()[0]])
+
+    assert scheduler._external_load_completion_ranks == {}
+    connector.notify_external_load_completion.assert_not_called()
+
+
+def test_job_tombstone_does_not_swallow_later_load_same_request():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler._direct_external_load_completed_jobs = {7: ("request-0", 4)}
+    connector.get_external_load_job_req_ids.side_effect = [
+        {8: "request-0"},
+        {},
+    ]
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 4, 8: 4}
+            ),
+        )
+    )
+
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+    assert scheduler._direct_external_load_completed_jobs == {}
+
+
+def test_old_direct_finished_signal_does_not_finish_partial_new_load():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler._direct_external_load_completed_jobs = {7: ("request-0", 2)}
+    connector.get_external_load_job_req_ids.side_effect = [
+        {8: "request-0"},
+        {8: "request-0"},
+        {8: "request-0"},
+        {},
+        {9: "request-0"},
+        {9: "request-0"},
+        {9: "request-0"},
+        {},
+    ]
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 2, 8: 2}
+            ),
+        )
+    )
+
+    assert scheduler.finished_recving_kv_req_ids == set()
+    assert scheduler._direct_external_load_completed_jobs == {}
+
+    # Simulate the req-only KVOutputAggregator having consumed a mixed set of
+    # old/new rank records above: it does not emit finished_recving again.
+    # Job-aware completed_jobs must still make the later LOAD ready.
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={8: 2}
+            ),
+        )
+    )
+
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+
+    scheduler.finished_recving_kv_req_ids.clear()
+    # The req-only aggregator can remain offset after the mixed job7/job8
+    # sequence and fire on only 2/4 records of job9. Job-aware pending state
+    # must suppress that false edge.
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={9: 2}
+            ),
+        )
+    )
+    assert scheduler.finished_recving_kv_req_ids == set()
+
+    # The real job9 completion remains authoritative even if the poisoned
+    # req-only aggregator emits no second edge.
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={9: 2}
+            ),
+        )
+    )
+    assert scheduler.finished_recving_kv_req_ids == {"request-0"}
+
+
+def test_reset_clears_partial_ranks_but_keeps_job_tombstone_for_late_normal():
+    scheduler, connector, _ = _make_direct_completion_scheduler()
+    scheduler.log_stats = False
+    scheduler._external_load_completion_ranks = {
+        8: ("request-1", {0}, 1.0)
+    }
+    scheduler._direct_external_load_completed_jobs = {7: ("request-0", 4)}
+    connector.reset_cache.return_value = True
+
+    assert scheduler.reset_connector_cache()
+
+    assert scheduler._external_load_completion_ranks == {}
+    assert scheduler._direct_external_load_completed_jobs == {
+        7: ("request-0", 4)
+    }
+
+
+def test_cancel_fast_complete_reset_then_late_normal_frees_once():
+    scheduler, connector, _ = _make_direct_completion_scheduler(
+        RequestStatus.FINISHED_ABORTED
+    )
+    scheduler.log_stats = False
+    connector.reset_cache.return_value = True
+
+    scheduler.notify_external_load_completions(_notices())
+    scheduler._external_load_completion_ranks = {
+        8: ("request-1", {0}, 1.0)
+    }
+    assert scheduler.reset_connector_cache()
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={"request-0"},
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 4}
+            ),
+        )
+    )
+
+    scheduler._free_blocks.assert_called_once()
+    assert scheduler._external_load_completion_ranks == {}
+    assert scheduler._direct_external_load_completed_jobs == {}
+
+
 def test_external_lookup_defers_while_request_transfer_jobs_are_pending():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     request = SimpleNamespace(request_id="request-0")
@@ -552,6 +1059,38 @@ def test_external_load_gpu_block_stats_are_exported_and_samples_drained():
         "external_load_gpu_block_peak_inflight_jobs": 2,
     }
     assert scheduler._external_load_job_gpu_block_counts == []
+
+
+def test_external_load_gpu_extent_stats_are_exported_and_drained():
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = SimpleNamespace()
+    scheduler._external_load_stage_latency_stats = defaultdict(list)
+    scheduler._external_load_gpu_extent_stats = defaultdict(
+        int,
+        {
+            "requested_entries": 2,
+            "allocator_selected_entries": 1,
+            "allocator_fallback_entries": 1,
+            "contiguous_entries": 1,
+            "noncontiguous_entries": 1,
+            "gpu_segments": 4,
+            "gpu_segment_savings": 12,
+        },
+    )
+
+    stats = scheduler.get_kv_connector_stats()
+
+    assert stats is not None
+    assert stats.reduce() == {
+        "external_load_gpu_extent_requested_entries": 2,
+        "external_load_gpu_extent_allocator_selected_entries": 1,
+        "external_load_gpu_extent_allocator_fallback_entries": 1,
+        "external_load_gpu_extent_contiguous_entries": 1,
+        "external_load_gpu_extent_noncontiguous_entries": 1,
+        "external_load_gpu_extent_gpu_segments": 4,
+        "external_load_gpu_extent_gpu_segment_savings": 12,
+    }
+    assert not scheduler._external_load_gpu_extent_stats
 
 
 def test_external_load_host_latency_stats_are_exported():

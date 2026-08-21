@@ -180,6 +180,8 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self._contiguous_extent_requests = 0
+        self._contiguous_extent_allocations = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -346,21 +348,98 @@ class BlockPool:
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
+        self._mark_blocks_allocated(ret)
+        return ret
+
+    def get_new_blocks_with_contiguous_extents(
+        self,
+        num_blocks: int,
+        extent_size: int,
+        logical_start_block: int,
+    ) -> list[KVCacheBlock]:
+        """Allocate blocks with best-effort contiguous full logical extents.
+
+        Only complete ``extent_size``-block logical extents are candidates.
+        Leading or trailing partial extents use the normal LRU allocator. If a
+        contiguous physical extent is unavailable, that logical extent also
+        falls back immediately to normal allocation.
+        """
+        if extent_size <= 1:
+            return self.get_new_blocks(num_blocks)
+        if logical_start_block < 0:
+            raise ValueError("logical_start_block must be non-negative")
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        if num_blocks == 0:
+            return []
+
+        leading_blocks = min(num_blocks, (-logical_start_block) % extent_size)
+        num_full_extents = (
+            num_blocks - leading_blocks
+        ) // extent_size
+        trailing_blocks = (
+            num_blocks - leading_blocks - num_full_extents * extent_size
+        )
+
+        # Preserve stock LRU allocation for a leading partial logical extent.
+        leading = self.free_block_queue.popleft_n(leading_blocks)
+        extents = self.free_block_queue.popleft_contiguous_extents(
+            num_full_extents, extent_size
+        )
+        self._contiguous_extent_requests += num_full_extents
+        self._contiguous_extent_allocations += len(extents)
+
+        num_fallback_blocks = (
+            (num_full_extents - len(extents)) * extent_size + trailing_blocks
+        )
+        fallback_blocks = self.free_block_queue.popleft_n(num_fallback_blocks)
+        fallback_cursor = 0
+        ret = list(leading)
+        for extent_idx in range(num_full_extents):
+            if extent_idx < len(extents):
+                ret.extend(extents[extent_idx])
+            else:
+                next_cursor = fallback_cursor + extent_size
+                ret.extend(fallback_blocks[fallback_cursor:next_cursor])
+                fallback_cursor = next_cursor
+        if trailing_blocks:
+            ret.extend(fallback_blocks[fallback_cursor:])
+        assert len(ret) == num_blocks
+
+        self._mark_blocks_allocated(ret)
+        return ret
+
+    def enable_contiguous_extent_allocation(self) -> None:
+        """Enable the lazy free-ID index used by extent allocation."""
+        self.free_block_queue.enable_contiguous_extent_index()
+
+    def take_contiguous_extent_allocation_stats(self) -> tuple[int, int]:
+        """Drain requested and successfully selected contiguous extents."""
+        stats = (
+            self._contiguous_extent_requests,
+            self._contiguous_extent_allocations,
+        )
+        self._contiguous_extent_requests = 0
+        self._contiguous_extent_allocations = 0
+        return stats
+
+    def _mark_blocks_allocated(self, blocks: list[KVCacheBlock]) -> None:
+        """Apply cache eviction, refcounts, and metrics to allocated blocks."""
+
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
-            for block in ret:
+            for block in blocks:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
-            for block in ret:
+            for block in blocks:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
-        return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """

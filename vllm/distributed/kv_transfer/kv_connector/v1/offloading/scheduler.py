@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
@@ -112,9 +113,18 @@ class SchedulerOffloadConfig(NamedTuple):
     block_size_factor: int
     num_workers: int
     offload_prompt_only: bool
+    external_load_contiguous_allocation: bool
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
+        external_load_contiguous_allocation = spec.extra_config.get(
+            "external_load_contiguous_allocation", False
+        )
+        if not isinstance(external_load_contiguous_allocation, bool):
+            raise TypeError(
+                "external_load_contiguous_allocation must be a boolean"
+            )
+
         # Determine the alignment token count from the full-attention group(s).
         # This is the offloaded_block_size of the full-attention group; load
         # hits are always aligned to this boundary, so SWA blocks earlier in
@@ -175,6 +185,9 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
+            external_load_contiguous_allocation=(
+                external_load_contiguous_allocation
+            ),
         )
 
 
@@ -335,6 +348,13 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        # Remaining ordinary per-rank completion records expected after a
+        # direct 4-rank completion has already finalized a LOAD job.
+        self._direct_load_duplicate_counts: dict[int, int] = {}
+        self._completion_notify_counters: defaultdict[str, int] = defaultdict(int)
+        self._completion_notify_latencies: defaultdict[
+            str, list[float]
+        ] = defaultdict(list)
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -353,6 +373,81 @@ class OffloadingConnectorScheduler:
         self._external_load_peak_inflight_jobs = 0
         self._scheduler_iteration_started_at_s: float | None = None
         self._scheduler_waiting_phase_started_at_s: float | None = None
+        self._gpu_block_pool: BlockPool | None = None
+        self._external_load_gpu_extent_stats: defaultdict[str, int] = defaultdict(int)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        if not self.config.external_load_contiguous_allocation:
+            return
+        gpu_block_pool.enable_contiguous_extent_allocation()
+        self._gpu_block_pool = gpu_block_pool
+
+    def get_external_load_gpu_block_extent_size(self) -> int | None:
+        if (
+            not self.config.external_load_contiguous_allocation
+            or self.config.block_size_factor <= 1
+        ):
+            return None
+        return self.config.block_size_factor
+
+    def _record_external_load_gpu_extent_stats(
+        self,
+        pending_block_groups: Sequence[tuple[int, Sequence[int]]],
+    ) -> None:
+        """Record allocator choices and resulting GPU segment topology."""
+        # Keep the default-off path free of block-ID traversal.
+        if not self.config.external_load_contiguous_allocation:
+            return
+        extent_size = self.config.block_size_factor
+        if extent_size <= 1:
+            return
+
+        requested_entries = 0
+        contiguous_entries = 0
+        gpu_segments = 0
+        for logical_start_block, block_ids in pending_block_groups:
+            leading_blocks = min(
+                len(block_ids), (-logical_start_block) % extent_size
+            )
+            cursor = leading_blocks
+            while cursor + extent_size <= len(block_ids):
+                entry_block_ids = block_ids[cursor : cursor + extent_size]
+                segments = 1 + sum(
+                    current != previous + 1
+                    for previous, current in zip(
+                        entry_block_ids, entry_block_ids[1:]
+                    )
+                )
+                requested_entries += 1
+                contiguous_entries += segments == 1
+                gpu_segments += segments
+                cursor += extent_size
+
+        stats = self._external_load_gpu_extent_stats
+        stats["requested_entries"] += requested_entries
+        stats["contiguous_entries"] += contiguous_entries
+        stats["noncontiguous_entries"] += (
+            requested_entries - contiguous_entries
+        )
+        stats["gpu_segments"] += gpu_segments
+        stats["gpu_segment_savings"] += (
+            requested_entries * extent_size - gpu_segments
+        )
+
+        if self._gpu_block_pool is None:
+            raise RuntimeError("external LOAD extent allocator has no GPU block pool")
+        allocator_requested, allocator_selected = (
+            self._gpu_block_pool.take_contiguous_extent_allocation_stats()
+        )
+        if allocator_requested != requested_entries:
+            raise RuntimeError(
+                "external LOAD extent accounting mismatch: "
+                f"allocator={allocator_requested}, load={requested_entries}"
+            )
+        stats["allocator_selected_entries"] += allocator_selected
+        stats["allocator_fallback_entries"] += (
+            allocator_requested - allocator_selected
+        )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -967,6 +1062,7 @@ class OffloadingConnectorScheduler:
 
         keys_to_load: list[OffloadKey] = []
         dst_block_ids: list[int] = []
+        pending_block_groups: list[tuple[int, Sequence[int]]] = []
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
@@ -1013,11 +1109,15 @@ class OffloadingConnectorScheduler:
                 )
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
-            dst_block_ids.extend(
+            pending_block_ids = [
                 block.block_id
                 for block in group_blocks[
                     num_locally_computed_gpu_blocks:num_gpu_blocks
                 ]
+            ]
+            dst_block_ids.extend(pending_block_ids)
+            pending_block_groups.append(
+                (num_locally_computed_gpu_blocks, pending_block_ids)
             )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(num_locally_computed_gpu_blocks)
@@ -1027,6 +1127,8 @@ class OffloadingConnectorScheduler:
             # blocks (including hits) are offloaded.
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
+
+        self._record_external_load_gpu_extent_stats(pending_block_groups)
 
         prepare_load_started_at_s = (
             time.monotonic() if self._profile_job_breakdown else None
@@ -1361,6 +1463,11 @@ class OffloadingConnectorScheduler:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        if not hasattr(self, "_direct_load_duplicate_counts"):
+            self._direct_load_duplicate_counts = {}
+        if not hasattr(self, "_completion_notify_counters"):
+            self._completion_notify_counters = defaultdict(int)
+            self._completion_notify_latencies = defaultdict(list)
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
@@ -1368,11 +1475,26 @@ class OffloadingConnectorScheduler:
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
+                self._direct_load_duplicate_counts.pop(job_id, None)
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
                     job_id,
                     self._stale_job_threshold,
                 )
+                continue
+            duplicate_count = self._direct_load_duplicate_counts.get(job_id)
+            if duplicate_count is not None:
+                self._completion_notify_counters[
+                    "normal_duplicate_rank_records"
+                ] += count
+                remaining = duplicate_count - count
+                if remaining > 0:
+                    self._direct_load_duplicate_counts[job_id] = remaining
+                else:
+                    self._direct_load_duplicate_counts.pop(job_id, None)
+                    self._completion_notify_counters[
+                        "normal_duplicate_jobs"
+                    ] += 1
                 continue
             job_status = self._jobs[job_id]
             job_status.failed_count += meta.failed_jobs.get(job_id, 0)
@@ -1424,6 +1546,71 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
+
+    def can_accept_external_load_completion(
+        self, job_id: int, req_id: str, worker_count: int
+    ) -> bool:
+        if job_id < self._stale_job_threshold:
+            return False
+        job = self._jobs.get(job_id)
+        return bool(
+            job is not None
+            and not job.is_store
+            and job.req_id == req_id
+            and worker_count == self.config.num_workers
+            # Ordinary model-step metadata may already have accounted for a
+            # subset of ranks before the last direct notice is observed.  The
+            # four unique success notices still prove the whole TP LOAD
+            # succeeded; only the still-pending records must be synthesized.
+            and 0 < job.pending_count <= worker_count
+        )
+
+    def notify_external_load_completion(
+        self, job_id: int, req_id: str, worker_count: int
+    ) -> int | None:
+        """Finalize a successful LOAD and return normal records still due.
+
+        The returned count is used by both scheduler layers as a job-aware
+        tombstone.  ``None`` means that ordinary metadata already won, the job
+        is stale, or the notice does not describe the active LOAD.
+        """
+        if not self.can_accept_external_load_completion(
+            job_id, req_id, worker_count
+        ):
+            return None
+        remaining = self._jobs[job_id].pending_count
+        self.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={job_id: remaining}
+                )
+            )
+        )
+        self._direct_load_duplicate_counts[job_id] = remaining
+        self._completion_notify_counters["fast_completed_jobs"] += 1
+        return remaining
+
+    def get_external_load_job_req_ids(
+        self, job_ids: Iterable[int]
+    ) -> dict[int, str]:
+        return {
+            job_id: job.req_id
+            for job_id in job_ids
+            if (job := self._jobs.get(job_id)) is not None and not job.is_store
+        }
+
+    def record_external_load_completion_notify_stats(
+        self,
+        counters: dict[str, int],
+        latencies: dict[str, list[float]],
+    ) -> None:
+        for name, value in counters.items():
+            if value > 0:
+                self._completion_notify_counters[name] += value
+        for name, samples in latencies.items():
+            self._completion_notify_latencies[name].extend(
+                sample for sample in samples if sample >= 0.0
+            )
 
     def request_finished(
         self,
@@ -1552,6 +1739,22 @@ class OffloadingConnectorScheduler:
                 }
             )
             self._external_load_stage_latency_stats.clear()
+        completion_counters = getattr(
+            self, "_completion_notify_counters", {}
+        )
+        completion_latencies = getattr(
+            self, "_completion_notify_latencies", {}
+        )
+        if completion_counters or completion_latencies:
+            stats.record_external_load_completion_notify_stats(
+                dict(completion_counters),
+                {
+                    name: list(samples)
+                    for name, samples in completion_latencies.items()
+                },
+            )
+            completion_counters.clear()
+            completion_latencies.clear()
         job_gpu_blocks = getattr(
             self, "_external_load_job_gpu_block_counts", []
         )
@@ -1579,6 +1782,14 @@ class OffloadingConnectorScheduler:
         ):
             stats.record_external_load_gpu_block_stats(gpu_block_stats)
             job_gpu_blocks.clear()
+        external_load_gpu_extent_stats = getattr(
+            self, "_external_load_gpu_extent_stats", None
+        )
+        if external_load_gpu_extent_stats:
+            stats.record_external_load_gpu_extent_stats(
+                dict(external_load_gpu_extent_stats)
+            )
+            external_load_gpu_extent_stats.clear()
         return None if stats.is_empty() else stats
 
     def reset_cache(self) -> None:
@@ -1603,6 +1814,7 @@ class OffloadingConnectorScheduler:
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
+        getattr(self, "_direct_load_duplicate_counts", {}).clear()
         self._block_id_to_pending_jobs.clear()
         self._external_load_inflight_gpu_blocks = 0
         self._external_load_inflight_jobs = 0

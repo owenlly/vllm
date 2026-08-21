@@ -186,6 +186,10 @@ class FreeKVCacheBlockQueue:
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
+        # The extent index is deliberately lazy. The default allocator never
+        # pays set/dict maintenance on its alloc/free hot paths.
+        self._free_block_ids: set[int] | None = None
+        self._blocks_by_id: dict[int, KVCacheBlock] | None = None
 
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
@@ -249,6 +253,8 @@ class FreeKVCacheBlockQueue:
         first_block.prev_free_block = first_block.next_free_block = None
 
         self.num_free_blocks -= 1
+        if self._free_block_ids is not None:
+            self._free_block_ids.remove(first_block.block_id)
         return first_block
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
@@ -276,6 +282,8 @@ class FreeKVCacheBlockQueue:
             # Reset prev_free_block and next_free_block of all popped blocks
             last_block.prev_free_block = None
             last_block.next_free_block = None
+            if self._free_block_ids is not None:
+                self._free_block_ids.remove(last_block.block_id)
 
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
@@ -303,6 +311,8 @@ class FreeKVCacheBlockQueue:
         # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
+        if self._free_block_ids is not None:
+            self._free_block_ids.remove(block.block_id)
 
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
@@ -326,6 +336,10 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = block
 
         self.num_free_blocks += 1
+        if self._free_block_ids is not None:
+            assert self._blocks_by_id is not None
+            self._free_block_ids.add(block.block_id)
+            self._blocks_by_id[block.block_id] = block
 
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks at the front of the free list."""
@@ -347,6 +361,10 @@ class FreeKVCacheBlockQueue:
         first_block.prev_free_block = prev_block
 
         self.num_free_blocks += len(blocks)
+        if self._free_block_ids is not None:
+            assert self._blocks_by_id is not None
+            self._free_block_ids.update(block.block_id for block in blocks)
+            self._blocks_by_id.update((block.block_id, block) for block in blocks)
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -372,6 +390,79 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = last_block
 
         self.num_free_blocks += len(blocks)
+
+        if self._free_block_ids is not None:
+            assert self._blocks_by_id is not None
+            self._free_block_ids.update(block.block_id for block in blocks)
+            self._blocks_by_id.update((block.block_id, block) for block in blocks)
+
+    def enable_contiguous_extent_index(self) -> None:
+        """Build the free-ID index only for an enabled extent allocator."""
+        if self._free_block_ids is not None:
+            return
+        free_blocks = self.get_all_free_blocks()
+        free_block_ids = {block.block_id for block in free_blocks}
+        if len(free_block_ids) != len(free_blocks):
+            raise ValueError("free KV cache block IDs must be unique")
+        self._free_block_ids = free_block_ids
+        self._blocks_by_id = {
+            block.block_id: block for block in free_blocks
+        }
+
+    def popleft_contiguous_extents(
+        self, num_extents: int, extent_size: int
+    ) -> list[list[KVCacheBlock]]:
+        """Pop best-effort physically contiguous extents in LRU-start order.
+
+        A candidate is considered when its first block is encountered while
+        walking the free queue from oldest to newest. Other blocks in the
+        extent can be newer eviction candidates; removals still go through
+        :meth:`remove` so queue and cache-eviction state remain correct.
+
+        Fewer than ``num_extents`` extents may be returned. Callers then fall
+        back to ordinary allocation immediately, without waiting.
+        """
+        if num_extents < 0:
+            raise ValueError("num_extents must be non-negative")
+        if extent_size <= 0:
+            raise ValueError("extent_size must be positive")
+        if num_extents == 0:
+            return []
+
+        # Production enables this once when the feature switch is bound, so
+        # each allocation below performs only one queue traversal. Keep this
+        # defensive lazy enable for direct BlockPool users.
+        self.enable_contiguous_extent_index()
+        assert self._free_block_ids is not None
+        assert self._blocks_by_id is not None
+
+        selected_ids: set[int] = set()
+        selected_starts: list[int] = []
+        curr_block = self.fake_free_list_head.next_free_block
+        while (
+            curr_block is not None
+            and curr_block is not self.fake_free_list_tail
+            and len(selected_starts) < num_extents
+        ):
+            start = curr_block.block_id
+            candidate_ids = range(start, start + extent_size)
+            if all(
+                block_id in self._free_block_ids
+                and block_id not in selected_ids
+                for block_id in candidate_ids
+            ):
+                selected_starts.append(start)
+                selected_ids.update(candidate_ids)
+            curr_block = curr_block.next_free_block
+
+        extents = [
+            [self._blocks_by_id[start + offset] for offset in range(extent_size)]
+            for start in selected_starts
+        ]
+        for extent in extents:
+            for block in extent:
+                self.remove(block)
+        return extents
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.

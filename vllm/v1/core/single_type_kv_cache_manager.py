@@ -185,6 +185,7 @@ class SingleTypeKVCacheManager(ABC):
         new_computed_blocks: Sequence[KVCacheBlock],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        external_load_gpu_block_extent_size: int | None = None,
     ) -> None:
         """
         Add the new computed blocks to the request. This involves three steps:
@@ -200,6 +201,8 @@ class SingleTypeKVCacheManager(ABC):
                 prefix cache.
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
+            external_load_gpu_block_extent_size: Best-effort contiguous GPU-block
+                extent for complete external offload entries.
         """
 
         if request_id in self.num_cached_block:
@@ -245,9 +248,21 @@ class SingleTypeKVCacheManager(ABC):
 
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
-            allocated_blocks = self.block_pool.get_new_blocks(
+            num_external_blocks = (
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
+            if external_load_gpu_block_extent_size is None:
+                allocated_blocks = self.block_pool.get_new_blocks(
+                    num_external_blocks
+                )
+            else:
+                allocated_blocks = (
+                    self.block_pool.get_new_blocks_with_contiguous_extents(
+                        num_blocks=num_external_blocks,
+                        extent_size=external_load_gpu_block_extent_size,
+                        logical_start_block=len(req_blocks),
+                    )
+                )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
@@ -1239,6 +1254,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         new_computed_blocks: Sequence[KVCacheBlock],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        external_load_gpu_block_extent_size: int | None = None,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so  `new_computed_blocks` should always be empty.
