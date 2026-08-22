@@ -1849,6 +1849,120 @@ def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling
 # ---------------------------------------------------------------------------
 
 
+def _make_source_fence_scheduler(
+    *, request_finished: bool = False, keep_scheduler_active: bool = False
+):
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    request = MagicMock()
+    request.is_finished.return_value = request_finished
+    req_status = SimpleNamespace(
+        req=request,
+        req_context=MagicMock(),
+        transfer_jobs={7},
+    )
+    scheduler._req_status = {"request-0": req_status}
+    if keep_scheduler_active:
+        active_request = MagicMock()
+        active_request.is_finished.return_value = False
+        scheduler._req_status["active"] = SimpleNamespace(
+            req=active_request,
+            req_context=MagicMock(),
+            transfer_jobs=set(),
+        )
+    scheduler._jobs = {
+        7: TransferJobStatus(
+            req_id="request-0",
+            pending_count=4,
+            keys=set(to_keys([1])),
+            is_store=True,
+            non_sliding_window_block_ids=[10, 11, 12],
+            sliding_window_block_ids=[20],
+        )
+    }
+    indexed_block_ids = (10, 11, 12, 20) if request_finished else (20,)
+    scheduler._block_id_to_pending_jobs = {
+        block_id: {7} for block_id in indexed_block_ids
+    }
+    scheduler._current_batch_load_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._current_batch_store_source_blocks_to_flush = defaultdict(set)
+    scheduler._current_batch_store_source_jobs_to_retire = set()
+    scheduler._current_batch_allocated_block_ids = set()
+    scheduler._stale_job_threshold = 0
+    scheduler._update_req_states = MagicMock()
+    scheduler._build_store_jobs = MagicMock(return_value={})
+    scheduler.manager = MagicMock()
+    return scheduler
+
+
+def test_reallocated_store_source_uses_exact_block_fence():
+    scheduler = _make_source_fence_scheduler(
+        request_finished=True, keep_scheduler_active=True
+    )
+    scheduler._current_batch_allocated_block_ids = {11}
+
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(preempted_req_ids=[])
+    )
+
+    assert metadata.jobs_to_flush == set()
+    assert metadata.store_source_blocks_to_flush == {7: (11,)}
+    assert scheduler._jobs[7].non_sliding_window_block_ids == [10, 12]
+    assert 11 not in scheduler._block_id_to_pending_jobs
+
+
+def test_preempted_store_uses_source_fence_but_all_finished_uses_whole_job():
+    scheduler = _make_source_fence_scheduler()
+
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(preempted_req_ids=["request-0"])
+    )
+
+    assert metadata.jobs_to_flush == set()
+    assert metadata.store_source_blocks_to_flush == {
+        7: (10, 11, 12, 20)
+    }
+
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(preempted_req_ids=["request-0"])
+    )
+    assert metadata.jobs_to_flush == set()
+    assert metadata.store_source_blocks_to_flush == {}
+
+    scheduler = _make_source_fence_scheduler(request_finished=True)
+    metadata = scheduler.build_connector_meta(
+        SimpleNamespace(preempted_req_ids=["request-0"])
+    )
+
+    assert metadata.jobs_to_flush == {7}
+    assert metadata.store_source_blocks_to_flush == {}
+
+
+def test_store_source_state_retires_only_after_all_tp_workers_complete():
+    scheduler = _make_source_fence_scheduler(
+        request_finished=True, keep_scheduler_active=True
+    )
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 3}
+            )
+        )
+    )
+    assert scheduler._current_batch_store_source_jobs_to_retire == set()
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={7: 1}
+            )
+        )
+    )
+    assert scheduler._current_batch_store_source_jobs_to_retire == {7}
+    scheduler.manager.complete_store.assert_called_once()
+
+
 def test_loads_do_not_populate_fence_index(request_runner):
     """Loads don't populate _block_id_to_pending_jobs (protected by
     delay_free_blocks while in flight)."""

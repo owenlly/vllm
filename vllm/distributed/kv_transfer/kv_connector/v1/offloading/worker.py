@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import replace
@@ -277,8 +278,26 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        source_blocks = (
+            kv_connector_metadata.store_source_blocks_to_flush or {}
+        )
+        if source_blocks:
+            started_at = time.monotonic()
+            self.worker.wait_store_source_safe(source_blocks)
+            # This is a rank-local blocking interval, not a sum or critical
+            # path reconstructed across tensor-parallel workers.
+            self.kv_connector_stats.record_fused_store_stage_latency_stats(
+                {"source_fence_wait_rank_local": [time.monotonic() - started_at]}
+            )
+
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
+
+        retired_store_jobs = (
+            kv_connector_metadata.store_source_jobs_to_retire or set()
+        )
+        if retired_store_jobs:
+            self.worker.retire_store_source_jobs(retired_store_jobs)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
@@ -361,6 +380,14 @@ class OffloadingConnectorWorker:
                         stage: [latency_s]
                         for stage, latency_s in (
                             transfer_result.fused_store_stage_latencies.items()
+                        )
+                    }
+                )
+            if transfer_result.fused_store_source_safe_latencies:
+                self.kv_connector_stats.record_fused_store_stage_latency_stats(
+                    {
+                        "immutable_to_rank_source_safe_entry": list(
+                            transfer_result.fused_store_source_safe_latencies
                         )
                     }
                 )

@@ -334,6 +334,10 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
+        self._current_batch_store_source_blocks_to_flush: defaultdict[
+            int, set[int]
+        ] = defaultdict(set)
+        self._current_batch_store_source_jobs_to_retire: set[int] = set()
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
         # if GPU prefix caching is enabled,
@@ -717,6 +721,33 @@ class OffloadingConnectorScheduler:
             pending.remove(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
+
+    @staticmethod
+    def _store_source_block_ids(job_status: TransferJobStatus) -> set[int]:
+        return set(job_status.non_sliding_window_block_ids or ()) | set(
+            job_status.sliding_window_block_ids or ()
+        )
+
+    def _release_store_source_fence(self, job_id: int, block_id: int) -> None:
+        """Stop tracking one source block after its fence is scheduled.
+
+        The worker cannot enter the model forward until the fence succeeds. If
+        it fails, execution terminates rather than reusing the source block.
+        """
+
+        job_status = self._jobs[job_id]
+        for block_ids in (
+            job_status.non_sliding_window_block_ids,
+            job_status.sliding_window_block_ids,
+        ):
+            if block_ids is not None:
+                block_ids[:] = [bid for bid in block_ids if bid != block_id]
+
+        pending = self._block_id_to_pending_jobs.get(block_id)
+        if pending is not None:
+            pending.discard(job_id)
+            if not pending:
+                del self._block_id_to_pending_jobs[block_id]
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -1419,9 +1450,26 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None or not req_status.transfer_jobs:
                 continue
-            any_jid = next(iter(req_status.transfer_jobs))
-            assert self._jobs[any_jid].is_store
-            self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
+            for job_id in req_status.transfer_jobs:
+                job_status = self._jobs[job_id]
+                assert job_status.is_store
+                source_block_ids = self._store_source_block_ids(job_status)
+                if not source_block_ids:
+                    if (
+                        job_status.non_sliding_window_block_ids is None
+                        and job_status.sliding_window_block_ids is None
+                    ):
+                        # A STORE without a source map cannot use the
+                        # fine-grained fence safely. Preserve whole-job wait.
+                        self._current_batch_jobs_to_flush.add(job_id)
+                    # Otherwise every source block was fenced by an earlier
+                    # reuse/preemption and this job has no GPU dependency left.
+                    continue
+                self._current_batch_store_source_blocks_to_flush[job_id].update(
+                    source_block_ids
+                )
+                for block_id in source_block_ids:
+                    self._release_store_source_fence(job_id, block_id)
 
         # Flush jobs that contain re-allocated blocks.
         if (
@@ -1430,12 +1478,18 @@ class OffloadingConnectorScheduler:
                 self._current_batch_allocated_block_ids
             )
         ):
-            self._current_batch_jobs_to_flush.update(
-                jid
-                for bid in self._current_batch_allocated_block_ids
-                if bid in self._block_id_to_pending_jobs
-                for jid in self._block_id_to_pending_jobs[bid]
-            )
+            reused_sources = [
+                (job_id, block_id)
+                for block_id in self._current_batch_allocated_block_ids
+                for job_id in tuple(
+                    self._block_id_to_pending_jobs.get(block_id, ())
+                )
+            ]
+            for job_id, block_id in reused_sources:
+                self._current_batch_store_source_blocks_to_flush[job_id].add(
+                    block_id
+                )
+                self._release_store_source_fence(job_id, block_id)
 
         # If all tracked requests are finished, flush all pending jobs
         # (both store and load) - there might not be a future scheduler
@@ -1445,13 +1499,28 @@ class OffloadingConnectorScheduler:
         ):
             self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
+        # Whole-job waits subsume source-only waits for the same STORE.
+        for job_id in self._current_batch_jobs_to_flush:
+            self._current_batch_store_source_blocks_to_flush.pop(job_id, None)
+
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            store_source_blocks_to_flush={
+                job_id: tuple(sorted(block_ids))
+                for job_id, block_ids in (
+                    self._current_batch_store_source_blocks_to_flush.items()
+                )
+            },
+            store_source_jobs_to_retire=(
+                self._current_batch_store_source_jobs_to_retire
+            ),
         )
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
+        self._current_batch_store_source_blocks_to_flush = defaultdict(set)
+        self._current_batch_store_source_jobs_to_retire = set()
         self._current_batch_allocated_block_ids = set()
         return meta
 
@@ -1468,6 +1537,8 @@ class OffloadingConnectorScheduler:
         if not hasattr(self, "_completion_notify_counters"):
             self._completion_notify_counters = defaultdict(int)
             self._completion_notify_latencies = defaultdict(list)
+        if not hasattr(self, "_current_batch_store_source_jobs_to_retire"):
+            self._current_batch_store_source_jobs_to_retire = set()
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
@@ -1511,6 +1582,7 @@ class OffloadingConnectorScheduler:
                     req_status.req_context,
                     success=success,
                 )
+                self._current_batch_store_source_jobs_to_retire.add(job_id)
             else:
                 if not req_status.external_load_ready_recorded:
                     req_status.req.record_event(
@@ -1798,10 +1870,14 @@ class OffloadingConnectorScheduler:
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
         assert not self._current_batch_jobs_to_flush
+        assert not self._current_batch_store_source_blocks_to_flush
         assert not self._current_batch_allocated_block_ids
 
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
+        self._current_batch_store_source_jobs_to_retire.update(
+            job_id for job_id, job in self._jobs.items() if job.is_store
+        )
 
         # Reset offloading manager cache
         self.manager.reset_cache()

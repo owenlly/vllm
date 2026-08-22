@@ -30,6 +30,14 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # STORE source blocks that are about to become reusable. Waiting for these
+    # blocks is weaker than waiting for the complete STORE: a capable handler
+    # may return as soon as it has stopped reading the listed GPU blocks.
+    store_source_blocks_to_flush: dict[int, tuple[int, ...]] | None = None
+    # STORE source-safety state can outlive a rank-local terminal result while
+    # the scheduler waits for the remaining TP ranks. Retire it only after the
+    # scheduler has observed whole-job completion from every rank.
+    store_source_jobs_to_retire: set[int] | None = None
 
 
 @dataclass

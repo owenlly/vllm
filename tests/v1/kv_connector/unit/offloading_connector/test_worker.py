@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 from collections import defaultdict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -196,6 +196,83 @@ def test_failed_store_reports_failure_without_invalid_gpu_load_blocks():
     assert metadata.completed_jobs == {23: 1}
     assert metadata.failed_jobs == {23: 1}
     assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_store_source_fence_submits_once_then_waits_and_retires():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+    )
+
+    worker = _make_completion_only_worker()
+    transfer_spec = MagicMock()
+    worker._unsubmitted_store_jobs = [(7, transfer_spec)]
+    worker.worker.transfer_async.return_value = True
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={},
+        jobs_to_flush={9},
+        store_source_blocks_to_flush={7: (3, 4)},
+        store_source_jobs_to_retire={5},
+    )
+
+    worker.handle_preemptions(metadata)
+
+    assert worker.worker.method_calls == [
+        call.transfer_async(7, transfer_spec),
+        call.wait_store_source_safe({7: (3, 4)}),
+        call.wait({9}),
+        call.retire_store_source_jobs({5}),
+    ]
+    assert worker._unsubmitted_store_jobs == []
+    recorder = worker.kv_connector_stats.record_fused_store_stage_latency_stats
+    recorder.assert_called_once()
+    metric = recorder.call_args.args[0]
+    assert len(metric["source_fence_wait_rank_local"]) == 1
+    assert metric["source_fence_wait_rank_local"][0] >= 0.0
+
+
+def test_store_source_fence_failure_stops_before_forward_dependencies():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+    )
+
+    worker = _make_completion_only_worker()
+    worker.worker.wait_store_source_safe.side_effect = RuntimeError("unsafe source")
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={},
+        jobs_to_flush={9},
+        store_source_blocks_to_flush={7: (3,)},
+        store_source_jobs_to_retire={5},
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe source"):
+        worker.handle_preemptions(metadata)
+
+    worker.worker.wait.assert_not_called()
+    worker.worker.retire_store_source_jobs.assert_not_called()
+    worker.kv_connector_stats.record_fused_store_stage_latency_stats.assert_not_called()
+
+
+def test_store_source_safe_entry_samples_are_recorded_without_averaging():
+    from vllm.v1.kv_offload.worker.worker import TransferResult
+
+    worker = _make_completion_only_worker()
+    samples = [0.01, 0.02, 0.04]
+    worker.worker.get_finished.return_value = [
+        TransferResult(
+            job_id=23,
+            success=True,
+            fused_store_source_safe_latencies=samples,
+        )
+    ]
+
+    worker.get_finished(set())
+
+    recorder = worker.kv_connector_stats.record_fused_store_stage_latency_stats
+    recorder.assert_called_once_with(
+        {"immutable_to_rank_source_safe_entry": samples}
+    )
 
 
 @pytest.mark.parametrize(

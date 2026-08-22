@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
+
 from vllm.v1.kv_offload.base import LoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingHandler,
@@ -36,6 +38,38 @@ class LoadStoreSpec2(LoadStoreSpec):
 
     def __repr__(self):
         return f"{self.medium()}: {id(self)}"
+
+
+class GPUStoreSpec(LoadStoreSpec):
+    @staticmethod
+    def medium() -> str:
+        return "GPU"
+
+
+class GPUStoreHandler(OffloadingHandler):
+    def __init__(self):
+        self.jobs: set[int] = set()
+        self.finished: list[TransferResult] = []
+        self.whole_waits: list[set[int]] = []
+        self.retired: list[set[int]] = []
+        self.fail_wait = False
+
+    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        self.jobs.add(job_id)
+        return True
+
+    def get_finished(self) -> list[TransferResult]:
+        finished = self.finished
+        self.finished = []
+        return finished
+
+    def wait(self, job_ids: set[int]) -> None:
+        if self.fail_wait:
+            raise RuntimeError(f"cannot prove source safety for {job_ids}")
+        self.whole_waits.append(set(job_ids))
+
+    def retire_store_source_jobs(self, job_ids: set[int]) -> None:
+        self.retired.append(set(job_ids))
 
 
 class OffloadingHandler1To2(OffloadingHandler):
@@ -163,3 +197,58 @@ def test_offloading_worker():
     src6.finished = True
     dst7.finished = True
     assert sorted(worker.get_finished()) == [(6, True), (7, True)]
+
+
+def test_store_source_wait_defaults_to_whole_job_and_retires_mapping():
+    worker = OffloadingWorker()
+    handler = GPUStoreHandler()
+    worker.register_handler(GPUStoreSpec, LoadStoreSpec2, handler)
+    assert worker.transfer_async(11, (GPUStoreSpec(), LoadStoreSpec2()))
+    terminal = TransferResult(job_id=11, success=True)
+    handler.finished.append(terminal)
+    assert worker.get_finished() == [terminal]
+    assert 11 in worker._store_job_to_handler
+
+    worker.wait_store_source_safe({11: (3, 4)})
+    assert handler.whole_waits == [{11}]
+
+    worker.retire_store_source_jobs({11})
+    assert handler.retired == [{11}]
+    assert worker._store_job_to_handler == {}
+    with pytest.raises(RuntimeError, match="unknown job 11"):
+        worker.wait_store_source_safe({11: (3,)})
+
+
+def test_store_source_wait_rejects_missing_job():
+    worker = OffloadingWorker()
+    handler = GPUStoreHandler()
+    worker.register_handler(GPUStoreSpec, LoadStoreSpec2, handler)
+
+    with pytest.raises(RuntimeError, match="unknown job 12"):
+        worker.wait_store_source_safe({12: (7,)})
+
+
+def test_store_source_default_fallback_failure_is_fail_stop():
+    worker = OffloadingWorker()
+    handler = GPUStoreHandler()
+    worker.register_handler(GPUStoreSpec, LoadStoreSpec2, handler)
+    assert worker.transfer_async(13, (GPUStoreSpec(), LoadStoreSpec2()))
+
+    handler.fail_wait = True
+    with pytest.raises(RuntimeError, match="cannot prove source safety"):
+        worker.wait_store_source_safe({13: (8,)})
+    assert 13 in worker._store_job_to_handler
+
+
+def test_duplicate_store_job_id_is_rejected_and_retire_is_idempotent():
+    worker = OffloadingWorker()
+    handler = GPUStoreHandler()
+    worker.register_handler(GPUStoreSpec, LoadStoreSpec2, handler)
+    spec = (GPUStoreSpec(), LoadStoreSpec2())
+    assert worker.transfer_async(14, spec)
+    with pytest.raises(ValueError, match="duplicate STORE transfer job ID 14"):
+        worker.transfer_async(14, spec)
+
+    worker.retire_store_source_jobs({14})
+    worker.retire_store_source_jobs({14})
+    assert handler.retired == [{14}]

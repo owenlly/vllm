@@ -28,6 +28,10 @@ class TransferResult:
     fused_load_stage_latencies: dict[str, float] | None = None
     # Optional connector-specific fused STORE stages, parallel to fused LOAD.
     fused_store_stage_latencies: dict[str, float] | None = None
+    # Per-entry time from immutable KV availability until the rank-local GPU
+    # source is no longer read. Keeping the samples avoids a job-size-biased
+    # mean in connector metrics.
+    fused_store_source_safe_latencies: list[float] | None = None
     fused_store_dedup_stats: dict[str, int] | None = None
     # Optional bounded resident/admission counters and byte accounting.
     fused_resident_stats: dict[str, int] | None = None
@@ -73,11 +77,27 @@ class OffloadingHandler(ABC):
 
     @abstractmethod
     def wait(self, job_ids: set[int]) -> None:
-        """
-        Wait for jobs to finish (blocking).
+        """Wait for jobs to finish (blocking).
+
         Args:
             job_ids: The set of job IDs to wait for.
         """
+
+    def wait_store_source_safe(
+        self, job_source_block_ids: dict[int, tuple[int, ...]]
+    ) -> None:
+        """Wait until STORE jobs no longer read selected GPU source blocks.
+
+        Handlers without finer-grained source completion preserve the existing
+        behavior by waiting for each complete job.
+        """
+
+        self.wait(set(job_source_block_ids))
+
+    def retire_store_source_jobs(self, job_ids: set[int]) -> None:
+        """Discard source-safety state for scheduler-retired STORE jobs."""
+
+        return
 
     def shutdown(self) -> None:
         """Shutdown the handler and release any resources."""
@@ -105,6 +125,9 @@ class OffloadingWorker:
     def __init__(self):
         self.handlers: set[OffloadingHandler] = set()
         self.transfer_type_to_handler: dict[TransferType, OffloadingHandler] = {}
+        # STORE handlers are retained past rank-local completion so a later
+        # block-reuse fence can still consult connector-specific tombstones.
+        self._store_job_to_handler: dict[int, OffloadingHandler] = {}
 
     def register_handler(
         self,
@@ -141,6 +164,8 @@ class OffloadingWorker:
         transfer_type = (src.medium(), dst.medium())
         handler = self.transfer_type_to_handler.get(transfer_type)
         assert handler is not None
+        if src.medium() == "GPU" and job_id in self._store_job_to_handler:
+            raise ValueError(f"duplicate STORE transfer job ID {job_id}")
         try:
             success = handler.transfer_async(job_id, spec)
         except Exception as e:
@@ -156,6 +181,8 @@ class OffloadingWorker:
         if not success:
             logger.warning("Failed to submit %r transfer %d", transfer_type, job_id)
         else:
+            if src.medium() == "GPU":
+                self._store_job_to_handler[job_id] = handler
             logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
         return success
 
@@ -181,6 +208,34 @@ class OffloadingWorker:
         for handler in self.handlers:
             handler.wait(job_ids)
 
+    def wait_store_source_safe(
+        self, job_source_block_ids: dict[int, tuple[int, ...]]
+    ) -> None:
+        """Route rank-local STORE source fences to the owning handlers."""
+
+        by_handler: dict[OffloadingHandler, dict[int, tuple[int, ...]]] = {}
+        for job_id, block_ids in job_source_block_ids.items():
+            handler = self._store_job_to_handler.get(job_id)
+            if handler is None:
+                raise RuntimeError(
+                    f"STORE source fence references unknown job {job_id}"
+                )
+            by_handler.setdefault(handler, {})[job_id] = block_ids
+        for handler, requirements in by_handler.items():
+            handler.wait_store_source_safe(requirements)
+
+    def retire_store_source_jobs(self, job_ids: set[int]) -> None:
+        """Retire STORE source-safety state after whole TP completion."""
+
+        by_handler: dict[OffloadingHandler, set[int]] = {}
+        for job_id in job_ids:
+            handler = self._store_job_to_handler.pop(job_id, None)
+            if handler is not None:
+                by_handler.setdefault(handler, set()).add(job_id)
+        for handler, retired_job_ids in by_handler.items():
+            handler.retire_store_source_jobs(retired_job_ids)
+
     def shutdown(self) -> None:
         for handler in self.handlers:
             handler.shutdown()
+        self._store_job_to_handler.clear()
