@@ -623,6 +623,9 @@ def test_aggregate_fused_resident_stats():
             "resident_hit_entries": 3,
             "admitted_entries": 4,
             "reject_frequency_entries": 2,
+            "urgent_resident_hit_entries": 2,
+            "urgent_admitted_entries": 3,
+            "urgent_candidate_evictions": 1,
             "resident_bytes": 84,
             "staging_bytes": 24,
             "storage_bytes": 60,
@@ -637,6 +640,9 @@ def test_aggregate_fused_resident_stats():
             "admitted_entries": 2,
             "reject_no_victim_entries": 1,
             "evictions": 2,
+            "urgent_resident_hit_entries": 1,
+            "urgent_admitted_entries": 1,
+            "urgent_candidate_evictions": 1,
             "resident_bytes": 36,
             "staging_bytes": 12,
             "storage_bytes": 24,
@@ -659,6 +665,9 @@ def test_aggregate_fused_resident_stats():
     assert reduced["fused_resident_load_reject_frequency_entries"] == 2
     assert reduced["fused_resident_load_reject_no_victim_entries"] == 1
     assert reduced["fused_resident_load_evictions"] == 2
+    assert reduced["fused_resident_load_urgent_resident_hit_entries"] == 3
+    assert reduced["fused_resident_load_urgent_admitted_entries"] == 4
+    assert reduced["fused_resident_load_urgent_candidate_evictions"] == 2
     assert reduced["fused_resident_load_resident_bytes"] == 120
     assert reduced["fused_resident_load_staging_bytes"] == 36
     assert reduced["fused_resident_load_storage_bytes"] == 84
