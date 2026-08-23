@@ -22,6 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_event_trace import (
+    emit_kv_event_trace,
+    encode_kv_keys,
+    external_request_id,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
@@ -227,6 +232,12 @@ class RequestOffloadState:
     # Prevent the allocation-wait sample from being emitted twice when the
     # scheduler-revisit breakdown is also enabled.
     gpu_allocation_wait_recorded: bool = False
+
+    def trace_keys_by_group(self) -> list[list[str]]:
+        return [
+            encode_kv_keys(group_state.offload_keys)
+            for group_state in self.group_states
+        ]
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -961,7 +972,20 @@ class OffloadingConnectorScheduler:
             req_context=req_context,
             offloading_context=offloading_context,
         )
+        req_status.update_offload_keys()
         self._req_status[request.request_id] = req_status
+        emit_kv_event_trace(
+            "request_open",
+            request_id=request.request_id,
+            external_request_id=external_request_id(request.request_id),
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_tokens=request.num_tokens,
+            keys_by_group=req_status.trace_keys_by_group(),
+            offloaded_block_sizes=[
+                group.offloaded_block_size
+                for group in self.config.kv_group_configs
+            ],
+        )
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -1020,6 +1044,16 @@ class OffloadingConnectorScheduler:
         ):
             req_status.external_ready_observed_at_s = time.monotonic()
         req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
+
+        if num_hit_tokens is not None:
+            emit_kv_event_trace(
+                "request_lookup",
+                request_id=request.request_id,
+                num_tokens=request.num_tokens,
+                num_local_tokens=num_computed_tokens,
+                num_external_tokens=num_hit_tokens,
+                keys_by_group=req_status.trace_keys_by_group(),
+            )
 
         self._touch(req_status)
 
@@ -1093,6 +1127,7 @@ class OffloadingConnectorScheduler:
 
         keys_to_load: list[OffloadKey] = []
         dst_block_ids: list[int] = []
+        trace_load_mapping: list[dict[str, Any]] = []
         pending_block_groups: list[tuple[int, Sequence[int]]] = []
         # per group
         group_sizes: list[int] = []
@@ -1138,7 +1173,29 @@ class OffloadingConnectorScheduler:
                 start_block_idx = (
                     num_locally_computed_gpu_blocks // self.config.block_size_factor
                 )
-                keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
+                group_keys_to_load = offload_keys[start_block_idx:num_blocks]
+                keys_to_load.extend(group_keys_to_load)
+                for key_idx, key in enumerate(
+                    group_keys_to_load, start=start_block_idx
+                ):
+                    gpu_start = max(
+                        num_locally_computed_gpu_blocks,
+                        key_idx * self.config.block_size_factor,
+                    )
+                    gpu_end = min(
+                        num_gpu_blocks,
+                        (key_idx + 1) * self.config.block_size_factor,
+                    )
+                    trace_load_mapping.append(
+                        {
+                            "key": encode_kv_keys([key])[0],
+                            "gpu_block_ids": [
+                                block.block_id
+                                for block in group_blocks[gpu_start:gpu_end]
+                                if block.block_id != 0
+                            ],
+                        }
+                    )
 
             pending_block_ids = [
                 block.block_id
@@ -1207,6 +1264,14 @@ class OffloadingConnectorScheduler:
             load_job_created_at_s=load_job_created_at_s,
             external_load_started_at_s=external_load_started_at_s,
             load_gpu_block_count=load_gpu_block_count,
+        )
+        emit_kv_event_trace(
+            "load_submit",
+            request_id=request.request_id,
+            job_id=load_job_id,
+            keys=encode_kv_keys(keys_to_load),
+            gpu_block_ids=dst_block_ids,
+            key_gpu_block_ids=trace_load_mapping,
         )
         self._start_external_load_gpu_block_tracking(load_gpu_block_count)
 
@@ -1359,6 +1424,7 @@ class OffloadingConnectorScheduler:
             group_sizes: list[int] = []
             block_indices: list[int] = []
             src_block_ids: list[int] = []
+            trace_store_mapping: list[dict[str, Any]] = []
             sliding_window_block_ids: list[int] = []
             non_sliding_window_block_ids: list[int] = []
             for group_config, group_state in zip(
@@ -1380,6 +1446,7 @@ class OffloadingConnectorScheduler:
 
                     offloaded_block_idx = start_block_idx + idx
                     gpu_block_idx = offloaded_block_idx * block_size_factor
+                    trace_gpu_block_ids: list[int] = []
                     for i in range(block_size_factor):
                         block_id = block_ids[gpu_block_idx + i]
                         if block_id == 0:
@@ -1387,11 +1454,18 @@ class OffloadingConnectorScheduler:
                         if start_gpu_block_idx is None:
                             start_gpu_block_idx = gpu_block_idx + i
                         src_block_ids.append(block_id)
+                        trace_gpu_block_ids.append(block_id)
                         num_group_blocks += 1
                         if is_sliding_window:
                             sliding_window_block_ids.append(block_id)
                         else:
                             non_sliding_window_block_ids.append(block_id)
+                    trace_store_mapping.append(
+                        {
+                            "key": encode_kv_keys([offload_key])[0],
+                            "gpu_block_ids": trace_gpu_block_ids,
+                        }
+                    )
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
@@ -1423,6 +1497,15 @@ class OffloadingConnectorScheduler:
                 is_store=True,
                 non_sliding_window_block_ids=non_sliding_window_block_ids,
                 sliding_window_block_ids=sliding_window_block_ids or None,
+            )
+
+            emit_kv_event_trace(
+                "store_submit",
+                request_id=req_id,
+                job_id=job_id,
+                keys=encode_kv_keys(keys_to_store),
+                gpu_block_ids=src_block_ids,
+                key_gpu_block_ids=trace_store_mapping,
             )
 
             store_jobs[job_id] = TransferJob(
@@ -1582,6 +1665,13 @@ class OffloadingConnectorScheduler:
                     req_status.req_context,
                     success=success,
                 )
+                emit_kv_event_trace(
+                    "store_complete",
+                    request_id=job_status.req_id,
+                    job_id=job_id,
+                    success=success,
+                    keys=encode_kv_keys(job_status.keys),
+                )
                 self._current_batch_store_source_jobs_to_retire.add(job_id)
             else:
                 if not req_status.external_load_ready_recorded:
@@ -1598,6 +1688,13 @@ class OffloadingConnectorScheduler:
                     self.manager.abort_load(
                         job_status.keys, req_status.req_context
                     )
+                emit_kv_event_trace(
+                    "load_complete",
+                    request_id=job_status.req_id,
+                    job_id=job_id,
+                    success=success,
+                    keys=encode_kv_keys(job_status.keys),
+                )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
                 self._finish_external_load_gpu_block_tracking(
@@ -1701,6 +1798,19 @@ class OffloadingConnectorScheduler:
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
         req_status = self._req_status.get(request.request_id)
+
+        if req_status is not None:
+            req_status.update_offload_keys()
+            keys_by_group = req_status.trace_keys_by_group()
+        else:
+            keys_by_group = []
+        emit_kv_event_trace(
+            "request_finish",
+            request_id=request.request_id,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_tokens=request.num_tokens,
+            keys_by_group=keys_by_group,
+        )
 
         req_context = (
             req_status.req_context if req_status else _create_req_context(request)

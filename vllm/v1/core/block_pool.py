@@ -11,6 +11,11 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.kv_event_trace import (
+    emit_kv_event_trace,
+    encode_kv_keys,
+    kv_event_trace_enabled,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -266,6 +271,8 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        trace_keys: list[bytes] | None = [] if kv_event_trace_enabled() else None
+        trace_block_ids: list[int] | None = [] if trace_keys is not None else None
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -283,6 +290,21 @@ class BlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+            if trace_keys is not None:
+                trace_keys.append(block_hash_with_group_id)
+                assert trace_block_ids is not None
+                trace_block_ids.append(blk.block_id)
+
+        if trace_keys:
+            assert trace_block_ids is not None
+            emit_kv_event_trace(
+                "hbm_store",
+                request_id=request.request_id,
+                keys=encode_kv_keys(trace_keys),
+                gpu_block_ids=trace_block_ids,
+                group_idx=kv_cache_group_id,
+                block_size_tokens=block_size,
+            )
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
@@ -428,12 +450,25 @@ class BlockPool:
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
+            evicted_keys: list[bytes] = []
+            evicted_block_ids: list[int] = []
             for block in blocks:
-                self._maybe_evict_cached_block(block)
+                previous_key = block.block_hash
+                if self._maybe_evict_cached_block(block):
+                    assert previous_key is not None
+                    evicted_keys.append(previous_key)
+                    evicted_block_ids.append(block.block_id)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+            if evicted_keys:
+                emit_kv_event_trace(
+                    "hbm_evict",
+                    cause="capacity_reuse",
+                    keys=encode_kv_keys(evicted_keys),
+                    gpu_block_ids=evicted_block_ids,
+                )
         else:
             for block in blocks:
                 assert block.ref_cnt == 0
@@ -529,6 +564,8 @@ class BlockPool:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
+        evicted_keys: list[bytes] = []
+        evicted_block_ids: list[int] = []
         for block_id in block_ids:
             assert block_id < len(self.blocks), (
                 f"Invalid block_id {block_id} >= {len(self.blocks)}. "
@@ -536,7 +573,18 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+            previous_key = block.block_hash
+            if self._maybe_evict_cached_block(block):
+                assert previous_key is not None
+                evicted_keys.append(previous_key)
+                evicted_block_ids.append(block_id)
+        if evicted_keys:
+            emit_kv_event_trace(
+                "hbm_evict",
+                cause="explicit_invalidation",
+                keys=encode_kv_keys(evicted_keys),
+                gpu_block_ids=evicted_block_ids,
+            )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
