@@ -45,6 +45,42 @@ from vllm.v1.request import RequestStatus
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
+def test_agent_prefix_lifecycle_reports_only_completed_blocks(
+    request_runner, async_scheduling: bool
+):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        block_size_factor=3,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[0] * 24)
+    runner.manager.on_request_prefix_open.assert_called_once()
+    open_groups = runner.manager.on_request_prefix_open.call_args.args[1]
+    assert tuple(map(len, open_groups)) == (2,)
+
+    # Twelve more tokens complete exactly one 12-token offload block. The
+    # extra scheduler step lets both sync and async scheduling observe it.
+    runner.run(decoded_tokens=[0] * 13)
+    runner.manager.on_request_prefix_update.assert_called_once()
+    update_groups = runner.manager.on_request_prefix_update.call_args.args[1]
+    assert tuple(map(len, update_groups)) == (3,)
+
+    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.manager.on_request_prefix_complete.assert_called_once()
+    complete_groups = runner.manager.on_request_prefix_complete.call_args.args[1]
+    assert tuple(map(len, complete_groups)) == (3,)
+    method_order = [entry[0] for entry in runner.manager.mock_calls]
+    assert method_order.index("on_request_prefix_complete") < method_order.index(
+        "on_request_finished"
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
 def test_offloading_connector(request_runner, async_scheduling: bool):
     block_size = 4
     block_size_factor = 3
