@@ -232,6 +232,7 @@ class RequestOffloadState:
     # Prevent the allocation-wait sample from being emitted twice when the
     # scheduler-revisit breakdown is also enabled.
     gpu_allocation_wait_recorded: bool = False
+    agentkv_reported_prefix_lengths: tuple[int, ...] = ()
 
     def trace_keys_by_group(self) -> list[list[str]]:
         return [
@@ -974,6 +975,17 @@ class OffloadingConnectorScheduler:
         )
         req_status.update_offload_keys()
         self._req_status[request.request_id] = req_status
+        self.manager.on_request_prefix_open(
+            req_context,
+            tuple(
+                tuple(group_state.offload_keys)
+                for group_state in req_status.group_states
+            ),
+        )
+        req_status.agentkv_reported_prefix_lengths = tuple(
+            len(group_state.offload_keys)
+            for group_state in req_status.group_states
+        )
         emit_kv_event_trace(
             "request_open",
             request_id=request.request_id,
@@ -1291,6 +1303,19 @@ class OffloadingConnectorScheduler:
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             req_status = self._req_status[req_id]
             req_status.update_offload_keys()
+            prefix_lengths = tuple(
+                len(group_state.offload_keys)
+                for group_state in req_status.group_states
+            )
+            if prefix_lengths != req_status.agentkv_reported_prefix_lengths:
+                self.manager.on_request_prefix_update(
+                    req_status.req_context,
+                    tuple(
+                        tuple(group_state.offload_keys)
+                        for group_state in req_status.group_states
+                    ),
+                )
+                req_status.agentkv_reported_prefix_lengths = prefix_lengths
 
             if preempted:
                 for group_state in req_status.group_states:
@@ -1815,6 +1840,14 @@ class OffloadingConnectorScheduler:
         req_context = (
             req_status.req_context if req_status else _create_req_context(request)
         )
+        if req_status is not None:
+            self.manager.on_request_prefix_complete(
+                req_context,
+                tuple(
+                    tuple(group_state.offload_keys)
+                    for group_state in req_status.group_states
+                ),
+            )
         self.manager.on_request_finished(req_context)
 
         if req_status is None:

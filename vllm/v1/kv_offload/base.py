@@ -262,6 +262,30 @@ class OffloadingManager(ABC):
         """
         return
 
+    def on_request_prefix_open(
+        self,
+        req_context: ReqContext,
+        keys_by_group: Sequence[Sequence[OffloadKey]],
+    ) -> None:
+        """Observe the KV prefix already present when a request opens."""
+        return
+
+    def on_request_prefix_complete(
+        self,
+        req_context: ReqContext,
+        keys_by_group: Sequence[Sequence[OffloadKey]],
+    ) -> None:
+        """Observe the full KV prefix before a finished request is freed."""
+        return
+
+    def on_request_prefix_update(
+        self,
+        req_context: ReqContext,
+        keys_by_group: Sequence[Sequence[OffloadKey]],
+    ) -> None:
+        """Observe newly completed KV blocks while a request is running."""
+        return
+
     def take_events(self) -> Iterable[OffloadingEvent]:
         """
         Take the offloading events from the manager.
