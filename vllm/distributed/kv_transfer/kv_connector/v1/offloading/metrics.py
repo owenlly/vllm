@@ -921,6 +921,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         self.counter_tiering_lookup_cpu_seconds: dict[
             tuple[int, str], PromMetricT
         ] = {}
+        self.counter_agentkv_events: dict[
+            tuple[int, str], PromMetricT
+        ] = {}
         self.counter_primary_eviction_events: dict[
             tuple[int, str], PromMetricT
         ] = {}
@@ -1246,6 +1249,65 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             ),
             labelnames=labelnames + ["tier"],
         )
+
+        self._counter_agentkv_events = self._counter_cls(
+            name="vllm:kv_offload_agentkv_events",
+            documentation=(
+                "Online AgentKV session inference and metadata lifecycle "
+                "events."
+            ),
+            labelnames=labelnames + ["event"],
+        )
+        counter_agentkv_metadata_submitted_blocks = self._counter_cls(
+            name="vllm:kv_offload_agentkv_metadata_submitted_blocks",
+            documentation=(
+                "Number of logical KV blocks included in AgentKV metadata "
+                "updates."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_agentkv_metadata_submitted_blocks = {
+            idx: counter_agentkv_metadata_submitted_blocks.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+        counter_agentkv_metadata_wait_seconds = self._counter_cls(
+            name="vllm:kv_offload_agentkv_metadata_wait_seconds",
+            documentation=(
+                "Total scheduler time waiting for AgentKV metadata to become "
+                "visible on every active DPU rank."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_agentkv_metadata_wait_seconds = {
+            idx: counter_agentkv_metadata_wait_seconds.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+        gauge_agentkv_available_sessions = self._gauge_cls(
+            name="vllm:kv_offload_agentkv_available_sessions",
+            documentation=(
+                "Number of completed AgentKV sessions available for online "
+                "continuation matching."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_agentkv_available_sessions = {
+            idx: gauge_agentkv_available_sessions.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
+        gauge_agentkv_open_requests = self._gauge_cls(
+            name="vllm:kv_offload_agentkv_open_requests",
+            documentation=(
+                "Number of requests currently attached to an online AgentKV "
+                "session."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_agentkv_open_requests = {
+            idx: gauge_agentkv_open_requests.labels(*values)
+            for idx, values in per_engine_labelvalues.items()
+        }
 
         self._counter_primary_eviction_events = self._counter_cls(
             name="vllm:kv_offload_primary_eviction_events",
@@ -1752,6 +1814,33 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
 
         for name, value in stats.items():
             if name == "total_blocks":
+                continue
+            if name == "agentkv_metadata_submitted_blocks":
+                self.counter_agentkv_metadata_submitted_blocks[engine_idx].inc(
+                    value
+                )
+                continue
+            if name == "agentkv_metadata_wait_ns":
+                self.counter_agentkv_metadata_wait_seconds[engine_idx].inc(
+                    value / 1_000_000_000
+                )
+                continue
+            if name == "agentkv_available_sessions":
+                self.gauge_agentkv_available_sessions[engine_idx].set(value)
+                continue
+            if name == "agentkv_open_requests":
+                self.gauge_agentkv_open_requests[engine_idx].set(value)
+                continue
+            if name.startswith("agentkv_"):
+                event = name.removeprefix("agentkv_")
+                counter_key = (engine_idx, event)
+                if counter_key not in self.counter_agentkv_events:
+                    self.counter_agentkv_events[counter_key] = (
+                        self._counter_agentkv_events.labels(
+                            *(self.per_engine_labelvalues[engine_idx] + [event])
+                        )
+                    )
+                self.counter_agentkv_events[counter_key].inc(value)
                 continue
             if name.endswith("_blocks"):
                 result = name.removesuffix("_blocks")
