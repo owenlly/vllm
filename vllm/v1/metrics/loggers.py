@@ -37,6 +37,14 @@ logger = init_logger(__name__)
 # User-facing reason labels for waiting request breakdown
 WAITING_REASON_CAPACITY = "capacity"
 WAITING_REASON_DEFERRED = "deferred"
+WAITING_CAPACITY_REASONS = (
+    "max_running",
+    "token_budget",
+    "kv_blocks",
+    "encoder",
+    "block_alignment",
+    "other",
+)
 
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
@@ -587,6 +595,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             }
             self.gauge_waiting_by_reason[waiting_reason] = create_metric_per_engine(
                 gauge_waiting_by_reason, per_engine_labelvalues_with_reason
+            )
+
+        gauge_waiting_capacity_by_reason = self._gauge_cls(
+            name="vllm:num_requests_waiting_by_capacity_reason",
+            documentation=(
+                "Number of ordinary waiting requests attributed to the "
+                "FCFS head constraint that stopped waiting admission."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["reason"],
+        )
+        self.gauge_waiting_capacity_by_reason: dict[str, dict[int, Gauge]] = {}
+        for capacity_reason in WAITING_CAPACITY_REASONS:
+            labelvalues_with_reason = {
+                idx: labelvalues + [capacity_reason]
+                for idx, labelvalues in per_engine_labelvalues.items()
+            }
+            self.gauge_waiting_capacity_by_reason[capacity_reason] = (
+                create_metric_per_engine(
+                    gauge_waiting_capacity_by_reason,
+                    labelvalues_with_reason,
+                )
             )
 
         gauge_engine_sleep_state = self._gauge_cls(
@@ -1237,6 +1267,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx].set(
                 scheduler_stats.num_skipped_waiting_reqs
             )
+            for capacity_reason in WAITING_CAPACITY_REASONS:
+                self.gauge_waiting_capacity_by_reason[capacity_reason][
+                    engine_idx
+                ].set(
+                    scheduler_stats.waiting_capacity_by_reason.get(
+                        capacity_reason, 0
+                    )
+                )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
             self.counter_hbm_ready_admissions[engine_idx].inc(
                 scheduler_stats.hbm_ready_admissions

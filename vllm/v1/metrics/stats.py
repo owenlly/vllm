@@ -176,6 +176,7 @@ class SchedulerStats:
 
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
+    waiting_capacity_by_reason: dict[str, int] = field(default_factory=dict)
 
     # Delta counters and the current LOOKUP_READY-over-ordinary bypass streak.
     # Deltas are drained each time Scheduler.make_stats() runs.

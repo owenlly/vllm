@@ -169,6 +169,7 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._waiting_capacity_by_reason: dict[str, int] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -479,6 +480,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        waiting_capacity_reason: str | None = None
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -727,6 +729,7 @@ class Scheduler(SchedulerInterface):
                 or self.skipped_waiting
             ) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    waiting_capacity_reason = "max_running"
                     break
 
                 (
@@ -961,6 +964,7 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+                        waiting_capacity_reason = "token_budget"
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -986,6 +990,7 @@ class Scheduler(SchedulerInterface):
                                 request_queue.pop_request()
                                 step_skipped_waiting.prepend_request(request)
                                 continue
+                            waiting_capacity_reason = "encoder"
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -1001,6 +1006,7 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+                        waiting_capacity_reason = "block_alignment"
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -1069,6 +1075,7 @@ class Scheduler(SchedulerInterface):
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
+                    waiting_capacity_reason = "kv_blocks"
                     break
 
                 # Close the async external-LOAD admission interval at the
@@ -1195,6 +1202,17 @@ class Scheduler(SchedulerInterface):
                     else:
                         for request in remaining_ready:
                             self.skipped_waiting.add_request(request)
+
+        if self.waiting:
+            if waiting_capacity_reason is None:
+                waiting_capacity_reason = (
+                    "token_budget" if token_budget == 0 else "other"
+                )
+            self._waiting_capacity_by_reason = {
+                waiting_capacity_reason: len(self.waiting)
+            }
+        else:
+            self._waiting_capacity_by_reason = {}
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -2505,6 +2523,9 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            waiting_capacity_by_reason=dict(
+                self._waiting_capacity_by_reason
+            ),
             hbm_ready_admissions=self._hbm_ready_admissions,
             external_load_ready_admissions=(
                 self._external_load_ready_admissions
