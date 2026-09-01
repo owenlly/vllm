@@ -72,8 +72,18 @@ def test_agent_prefix_lifecycle_reports_only_completed_blocks(
 
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
     runner.manager.on_request_prefix_complete.assert_called_once()
-    complete_groups = runner.manager.on_request_prefix_complete.call_args.args[1]
+    complete_args = runner.manager.on_request_prefix_complete.call_args.args
+    complete_groups = complete_args[1]
     assert tuple(map(len, complete_groups)) == (3,)
+    hbm_presence = complete_args[2]
+    hbm_block_ids = complete_args[3]
+    assert tuple(map(len, hbm_presence)) == (3,)
+    assert tuple(map(len, hbm_block_ids)) == (3,)
+    assert all(
+        len(block_ids) == runner.block_size_factor
+        for block_ids in hbm_block_ids[0]
+        if block_ids
+    )
     method_order = [entry[0] for entry in runner.manager.mock_calls]
     assert method_order.index("on_request_prefix_complete") < method_order.index(
         "on_request_finished"

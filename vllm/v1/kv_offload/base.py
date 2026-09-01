@@ -274,8 +274,19 @@ class OffloadingManager(ABC):
         self,
         req_context: ReqContext,
         keys_by_group: Sequence[Sequence[OffloadKey]],
+        hbm_present_by_group: Sequence[Sequence[bool]] | None = None,
+        hbm_block_ids_by_group: Sequence[
+            Sequence[Sequence[int]]
+        ] | None = None,
     ) -> None:
-        """Observe the full KV prefix before a finished request is freed."""
+        """Observe the full KV prefix before a finished request is freed.
+
+        ``hbm_present_by_group`` is an optional scheduler snapshot aligned to
+        ``keys_by_group``. It is diagnostic metadata only and must not change
+        LOAD correctness.
+        """
+        del hbm_present_by_group
+        del hbm_block_ids_by_group
         return
 
     def on_request_prefix_update(

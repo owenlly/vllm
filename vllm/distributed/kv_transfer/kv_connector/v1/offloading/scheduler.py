@@ -1841,12 +1841,35 @@ class OffloadingConnectorScheduler:
             req_status.req_context if req_status else _create_req_context(request)
         )
         if req_status is not None:
+            block_size_factor = self.config.block_size_factor
+            hbm_present_by_group: list[tuple[bool, ...]] = []
+            hbm_block_ids_by_group: list[tuple[tuple[int, ...], ...]] = []
+            for group_state in req_status.group_states:
+                group_presence: list[bool] = []
+                group_block_ids: list[tuple[int, ...]] = []
+                for key_index in range(len(group_state.offload_keys)):
+                    start = key_index * block_size_factor
+                    end = start + block_size_factor
+                    block_ids = tuple(group_state.block_ids[start:end])
+                    group_presence.append(
+                        end <= len(group_state.block_ids)
+                        and all(
+                            block_id != 0 for block_id in block_ids
+                        )
+                    )
+                    group_block_ids.append(
+                        block_ids if group_presence[-1] else ()
+                    )
+                hbm_present_by_group.append(tuple(group_presence))
+                hbm_block_ids_by_group.append(tuple(group_block_ids))
             self.manager.on_request_prefix_complete(
                 req_context,
                 tuple(
                     tuple(group_state.offload_keys)
                     for group_state in req_status.group_states
                 ),
+                tuple(hbm_present_by_group),
+                tuple(hbm_block_ids_by_group),
             )
         self.manager.on_request_finished(req_context)
 
