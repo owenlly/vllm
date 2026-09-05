@@ -596,6 +596,32 @@ class TieringOffloadingManager(OffloadingManager):
                     cpu_s=time.thread_time() - total_cpu_start,
                 )
 
+    @override
+    def peek(self, key: OffloadKey) -> bool | None:
+        """
+        Check whether a block is held by any tier, without side effects.
+
+        No promotion is started and no lookup statistics are recorded, so
+        the scheduler can probe blocks it does not intend to load (for
+        example, a prefix already cached on the GPU) purely for metrics.
+
+        Returns:
+            True if the primary tier or any secondary tier holds the block,
+            False if every tier answered and none holds it, or None if the
+            block was not found in a tier that answered and at least one
+            tier cannot answer without side effects.
+        """
+        if self.primary_tier.peek(key):
+            return True
+        unknown = False
+        for tier in self.secondary_tiers:
+            present = tier.peek(key)
+            if present is True:
+                return True
+            if present is None:
+                unknown = True
+        return None if unknown else False
+
     def _initiate_promotion(
         self,
         tier: SecondaryTierManager,

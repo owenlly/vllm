@@ -753,6 +753,35 @@ class TestTieringOffloadingManager:
         # Lookup all 5 blocks should return 3 (first 3 found)
         assert count_hits(self.manager, blocks) == 3
 
+    def test_peek_reports_presence_without_side_effects(self, manager_setup):
+        """peek() sees every tier but never promotes or records lookups."""
+        primary_only, secondary_only, absent = to_keys(range(3))
+
+        self.manager.prepare_store([primary_only], _CTX)
+        self.manager.complete_store([primary_only], _CTX, success=True)
+        self.secondary_tier2.blocks[secondary_only] = True
+        self.manager.take_tiering_lookup_stats()  # drain the store's lookups
+
+        assert self.manager.peek(primary_only) is True
+        assert self.manager.peek(secondary_only) is True
+        assert self.manager.peek(absent) is False
+
+        # No promotion was queued for the secondary-only block and the
+        # lookup counters did not move.
+        assert not self.manager._pending_load_submissions
+        assert count_hits(self.primary_tier, [secondary_only]) == 0
+        assert self.manager.take_tiering_lookup_stats() == {}
+
+    def test_peek_is_unknown_when_a_tier_cannot_answer(self, manager_setup):
+        """A tier without side-effect-free presence yields None on a miss."""
+        key = to_keys([0])[0]
+        self.secondary_tier1.peek = lambda _key: None  # type: ignore[assignment]
+
+        assert self.manager.peek(key) is None
+
+        self.secondary_tier2.blocks[key] = True
+        assert self.manager.peek(key) is True
+
     def test_eviction_in_primary_tier(self, manager_setup):
         """Test eviction in primary tier when capacity is exceeded."""
         # Primary tier has capacity of 5 blocks

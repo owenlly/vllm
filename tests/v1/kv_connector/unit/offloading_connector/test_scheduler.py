@@ -425,6 +425,87 @@ def test_can_skip_external_lookup_requires_no_complete_offload_block():
     assert not scheduler.can_skip_external_lookup(request, 144)
 
 
+def _attribution_scheduler(
+    offload_keys: list[str],
+    num_local_tokens: int,
+    num_hit_blocks: int,
+    present: set[str],
+    unknown: set[str] | None = None,
+) -> OffloadingConnectorScheduler:
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = SimpleNamespace(
+        kv_group_configs=[SimpleNamespace(offloaded_block_size=128)]
+    )
+    scheduler._lookup_groups = (0,)
+    scheduler._sliding_window_groups = ()
+    scheduler.manager = MagicMock()
+    scheduler.manager.peek.side_effect = lambda key: (
+        None if key in (unknown or set()) else key in present
+    )
+    scheduler._req_status = {
+        "request": SimpleNamespace(
+            num_locally_computed_tokens=num_local_tokens,
+            group_states=[
+                SimpleNamespace(
+                    offload_keys=offload_keys, num_hit_blocks=num_hit_blocks
+                )
+            ],
+            external_full_hit_memo=None,
+        )
+    }
+    return scheduler
+
+
+def test_external_prefix_cache_hit_tokens_includes_gpu_cached_overlap():
+    keys = ["k0", "k1", "k2", "k3"]
+    request = SimpleNamespace(request_id="request", num_tokens=512)
+
+    # GPU holds the first two blocks; the lookup found one more beyond them,
+    # so num_hit_blocks = 3. Every GPU-cached block is also offloaded.
+    scheduler = _attribution_scheduler(
+        keys, num_local_tokens=256, num_hit_blocks=3, present={"k0", "k1", "k2"}
+    )
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) == 384
+    # Only the GPU-cached prefix was peeked; the lookup already covered k2.
+    assert scheduler.manager.peek.call_args_list == [call("k0"), call("k1")]
+
+    # A hole inside the GPU-cached prefix ends the external prefix early.
+    scheduler = _attribution_scheduler(
+        keys, num_local_tokens=256, num_hit_blocks=3, present={"k0", "k2"}
+    )
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) == 128
+
+    # Nothing cached on the GPU: the lookup result is the whole answer.
+    scheduler = _attribution_scheduler(
+        keys, num_local_tokens=0, num_hit_blocks=2, present={"k0", "k1"}
+    )
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) == 256
+    scheduler.manager.peek.assert_not_called()
+
+
+def test_external_prefix_cache_hit_tokens_is_memoized_and_can_be_unknown():
+    keys = ["k0", "k1"]
+    request = SimpleNamespace(request_id="request", num_tokens=256)
+
+    scheduler = _attribution_scheduler(
+        keys, num_local_tokens=128, num_hit_blocks=2, present={"k0", "k1"}
+    )
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) == 256
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) == 256
+    assert scheduler.manager.peek.call_count == 1
+
+    scheduler = _attribution_scheduler(
+        keys, num_local_tokens=128, num_hit_blocks=2, present=set(), unknown={"k0"}
+    )
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) is None
+
+    scheduler._sliding_window_groups = (1,)
+    assert scheduler.get_external_prefix_cache_hit_tokens(request) is None
+    assert scheduler.get_external_prefix_cache_hit_tokens(
+        SimpleNamespace(request_id="unknown", num_tokens=256)
+    ) is None
+
+
 def test_take_external_lookup_ready_request_ids_forwards_manager_hints():
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = MagicMock()

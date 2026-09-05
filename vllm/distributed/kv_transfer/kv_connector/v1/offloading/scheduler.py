@@ -233,6 +233,9 @@ class RequestOffloadState:
     # scheduler-revisit breakdown is also enabled.
     gpu_allocation_wait_recorded: bool = False
     agentkv_reported_prefix_lengths: tuple[int, ...] = ()
+    # Memo for get_external_prefix_cache_hit_tokens(): the (local tokens,
+    # hit blocks) pair the value was derived from, and the value itself.
+    external_full_hit_memo: tuple[tuple[int, int], int | None] | None = None
 
     def trace_keys_by_group(self) -> list[list[str]]:
         return [
@@ -1070,6 +1073,66 @@ class OffloadingConnectorScheduler:
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
+
+    def get_external_prefix_cache_hit_tokens(self, request: Request) -> int | None:
+        """Return the full external prefix hit, overlap with GPU KV included.
+
+        get_num_new_matched_tokens() only looks up blocks beyond the locally
+        cached prefix, so the scheduler cannot tell from it alone whether the
+        GPU-cached part is also offloaded. This method answers that with a
+        side-effect-free peek over the locally cached blocks and combines it
+        with the completed lookup. It feeds prompt-cache attribution metrics
+        and never affects scheduling.
+
+        Args:
+            request: Request whose external lookup has completed.
+
+        Returns:
+            Number of leading prompt tokens (offload-block aligned) present
+            in the offloading manager, or None when the manager cannot peek
+            without side effects or the model has sliding-window groups.
+        """
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None or self._sliding_window_groups:
+            return None
+        peek = getattr(self.manager, "peek", None)
+        if not callable(peek):
+            return None
+
+        num_local_tokens = req_status.num_locally_computed_tokens
+        result: int | None = None
+        memo_key: tuple[int, int] | None = None
+        for group_idx in self._lookup_groups:
+            group_config = self.config.kv_group_configs[group_idx]
+            group_state = req_status.group_states[group_idx]
+            block_size = group_config.offloaded_block_size
+            local_blocks = num_local_tokens // block_size
+            memo_key = (num_local_tokens, group_state.num_hit_blocks)
+            memo = req_status.external_full_hit_memo
+            if memo is not None and memo[0] == memo_key:
+                return memo[1]
+
+            present: bool | None = True
+            overlap_blocks = 0
+            for key in islice(group_state.offload_keys, local_blocks):
+                present = peek(key)
+                if present is not True:
+                    break
+                overlap_blocks += 1
+            if present is None:
+                result = None
+                break
+            if overlap_blocks < local_blocks:
+                group_hit = overlap_blocks * block_size
+            else:
+                # The whole GPU-cached prefix is offloaded too; the lookup
+                # result already covers the blocks beyond it.
+                group_hit = max(group_state.num_hit_blocks, local_blocks) * block_size
+            result = group_hit if result is None else min(result, group_hit)
+
+        if memo_key is not None:
+            req_status.external_full_hit_memo = (memo_key, result)
+        return result
 
     def on_external_load_allocation_failure(self, request: Request) -> None:
         if not getattr(self, "_profile_job_breakdown", True):

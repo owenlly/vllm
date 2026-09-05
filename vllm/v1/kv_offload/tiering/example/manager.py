@@ -81,6 +81,10 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         return key in self.blocks
 
     @override
+    def peek(self, key: OffloadKey) -> bool | None:
+        return key in self.blocks
+
+    @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         """
         Submit a job to store blocks from primary tier to this tier.

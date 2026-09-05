@@ -122,6 +122,11 @@ class FileSystemTierManager(SecondaryTierManager):
         return os.path.exists(self.file_mapper.get_file_name(key))
 
     @override
+    def peek(self, key: OffloadKey) -> bool | None:
+        # lookup() on this tier is already a side-effect-free stat().
+        return os.path.exists(self.file_mapper.get_file_name(key))
+
+    @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
         primary_kv_view = self._primary_kv_view
         assert primary_kv_view is not None

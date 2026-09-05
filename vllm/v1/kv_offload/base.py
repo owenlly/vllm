@@ -174,6 +174,25 @@ class OffloadingManager(ABC):
         """
         return
 
+    def peek(self, key: OffloadKey) -> bool | None:
+        """
+        Check whether a block is present without any side effect.
+
+        Unlike lookup(), this must not touch eviction state, record
+        tracker statistics, or start a transfer. It is used for metrics
+        attribution only (for example, to learn whether a prefix that is
+        already cached on the GPU is also held by the offloading manager).
+
+        Args:
+            key: the key identifying the block.
+
+        Returns:
+            True if the block is present (ready or with a write in flight),
+            False if it is absent, or None if the manager cannot answer
+            without side effects.
+        """
+        return None
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Marks previous blocks that were prepared to load as done loading.

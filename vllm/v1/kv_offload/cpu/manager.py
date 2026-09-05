@@ -131,6 +131,11 @@ class CPUOffloadingManager(OffloadingManager):
         return True
 
     @override
+    def peek(self, key: OffloadKey) -> bool | None:
+        # A plain dictionary probe: no access tracker update, no LRU touch.
+        return self._policy.get(key) is not None
+
+    @override
     def prepare_load(
         self,
         keys: Collection[OffloadKey],

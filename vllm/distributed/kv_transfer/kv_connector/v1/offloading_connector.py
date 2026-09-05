@@ -151,6 +151,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def get_external_prefix_cache_hit_tokens(
+        self, request: "Request"
+    ) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_external_prefix_cache_hit_tokens(
+            request
+        )
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

@@ -144,6 +144,39 @@ def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is True
 
 
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+def test_peek_reports_presence_without_touching_state(eviction_policy):
+    """peek() answers from the block table without LRU or tracker updates."""
+    manager = CPUOffloadingManager(num_blocks=2, cache_policy=eviction_policy)
+
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    # Block 1 is complete, block 2 still has its write in flight.
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+    assert manager.peek(to_key(1)) is True
+    assert manager.peek(to_key(2)) is True
+    assert manager.peek(to_key(3)) is False
+
+    if eviction_policy == "lru":
+        # peek() did not refresh block 1, so it is still the LRU victim.
+        manager.complete_store(to_keys([2]), _EMPTY_REQ_CTX)
+        prepare_store_output = manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+        assert prepare_store_output is not None
+        assert prepare_store_output.evicted_keys == to_keys([1])
+
+
+def test_peek_does_not_feed_the_store_threshold_tracker():
+    """lookup() counts accesses toward store_threshold; peek() must not."""
+    manager = CPUOffloadingManager(num_blocks=2, store_threshold=2)
+    assert manager.counts is not None
+
+    assert manager.peek(to_key(1)) is False
+    assert dict(manager.counts) == {}
+
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is False
+    assert dict(manager.counts) == {to_key(1): 1}
+
+
 def test_cpu_manager():
     """
     Tests CPUOffloadingManager with lru policy.

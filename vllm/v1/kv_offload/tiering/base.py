@@ -94,6 +94,22 @@ class SecondaryTierManager(ABC):
         """
         pass
 
+    def peek(self, key: OffloadKey) -> bool | None:
+        """
+        Check whether a block exists in this tier without side effects.
+
+        Unlike lookup(), this must not start a promotion or change any
+        eviction state. It only feeds metrics attribution.
+
+        Args:
+            key: Offload key to check.
+
+        Returns:
+            True if present, False if absent, or None if this tier cannot
+            answer without side effects (the default).
+        """
+        return None
+
     def filter_store_keys(
         self,
         keys: Collection[OffloadKey],
