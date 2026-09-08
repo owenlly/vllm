@@ -144,6 +144,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
                 enable_events=enable_events,
+                # Opt-in thread CPU / wall timing of every lookup, exported as
+                # vllm:kv_offload_tiering_lookup_{cpu,wall}_seconds.
+                profile_block_lookup=bool(
+                    self.extra_config.get("profile_block_lookup", False)
+                ),
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
