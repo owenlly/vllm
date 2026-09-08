@@ -71,6 +71,18 @@ class JobState:
         )
 
 
+def _set_native_thread_name(name: str) -> None:
+    """Expose the worker's name as the kernel comm (15 bytes) so per-thread
+    CPU accounting from /proc can attribute I/O worker time."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(15, name.encode("utf-8")[:15], 0, 0, 0)
+    except Exception:
+        return
+
+
 class DualQueueThreadPool:
     """
     Thread pool with two task queues (load and store) and two thread groups.
@@ -166,6 +178,7 @@ class DualQueueThreadPool:
                 t.join()
 
     def _worker(self, load_priority: bool) -> None:
+        _set_native_thread_name(threading.current_thread().name)
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
             with self._condition:
