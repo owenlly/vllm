@@ -227,17 +227,20 @@ def test_presence_dedup_filters_stored_keys(fs_tier):
 
 def test_presence_dedup_ignores_failed_store(fs_tier, tmp_path):
     tier, _ = fs_tier
-    # Make the destination directory unwritable so the store fails.
+    # Put a regular file where the destination's parent directory should be
+    # so the store task cannot create its temp file (works as root too).
     dest = tier.file_mapper.get_file_name(key(7))
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    os.chmod(os.path.dirname(dest), 0o500)
+    parent = os.path.dirname(dest)
+    os.makedirs(os.path.dirname(parent), exist_ok=True)
+    with open(parent, "w") as f:
+        f.write("not a directory")
     try:
         tier.submit_store(make_job(3, [key(7)], [0]))
         results = drain(tier)
         assert len(results) == 1 and not results[0].success
         assert tier.filter_store_keys([key(7)], _CTX) == (key(7),)
     finally:
-        os.chmod(os.path.dirname(dest), 0o700)
+        os.remove(parent)
 
 
 def test_quiesce_makes_submitted_jobs_reportable(fs_tier):
