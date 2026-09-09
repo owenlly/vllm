@@ -144,6 +144,62 @@ class TestExampleSecondaryTierManager:
         assert tier._primary_kv_view is None
 
 
+def test_dedup_before_primary_skips_the_gpu_copy():
+    """Blocks a secondary tier already holds never reach keys_to_store."""
+    primary = _DPUPrimaryManager(num_blocks=4)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    held: set = set()
+    secondary.filter_store_keys = lambda keys, ctx: tuple(
+        k for k in keys if k not in held
+    )
+    manager = TieringOffloadingManager(
+        primary, [secondary], dedup_before_primary=True
+    )
+    blocks = to_keys(range(3))
+
+    # Nothing known yet: every block is copied.
+    out = manager.prepare_store(blocks, _CTX)
+    assert out is not None
+    assert list(out.keys_to_store) == list(blocks)
+    manager.complete_store(blocks, _CTX, success=True)
+    manager.reset_cache()
+
+    # The secondary now holds the first two: only the third is copied.
+    held.update(blocks[:2])
+    out = manager.prepare_store(blocks, _CTX)
+    assert out is not None
+    assert list(out.keys_to_store) == [blocks[2]]
+
+    # All held: prepare_store returns an empty result, no copy at all.
+    held.update(blocks)
+    manager.reset_cache()
+    out = manager.prepare_store(blocks, _CTX)
+    assert out is not None
+    assert list(out.keys_to_store) == []
+
+
+def test_dedup_before_primary_off_by_default():
+    """Without the flag the secondary tiers are not consulted up front."""
+    primary = _DPUPrimaryManager(num_blocks=4)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    secondary.filter_store_keys = MagicMock(side_effect=lambda keys, ctx: ())
+    manager = TieringOffloadingManager(primary, [secondary])
+    blocks = to_keys(range(2))
+
+    out = manager.prepare_store(blocks, _CTX)
+    assert out is not None
+    assert list(out.keys_to_store) == list(blocks)
+    secondary.filter_store_keys.assert_not_called()
+
+
 def test_block_id_primary_supports_cascade_promotion_and_reset():
     """Tiering only requires BlockIDsLoadStoreSpec, not CPU-specific specs."""
     primary = _DPUPrimaryManager(num_blocks=3)

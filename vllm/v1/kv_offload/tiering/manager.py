@@ -139,6 +139,7 @@ class TieringOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         profile_block_lookup: bool = False,
         profile_job_breakdown: bool = True,
+        dedup_before_primary: bool = False,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -151,15 +152,23 @@ class TieringOffloadingManager(OffloadingManager):
             profile_block_lookup: Whether to record per-block lookup runtimes.
             profile_job_breakdown: Whether to correlate secondary promotions
                 with the subsequent primary-to-GPU load.
+            dedup_before_primary: Ask the secondary tiers which keys they
+                already hold *before* the primary tier decides what to store,
+                so blocks that are already durable are never copied from the
+                GPU. Only tiers whose filter_store_keys answers from local
+                metadata benefit; the default keeps the original behavior.
         """
         if not isinstance(profile_block_lookup, bool):
             raise TypeError("profile_block_lookup must be a boolean")
         if not isinstance(profile_job_breakdown, bool):
             raise TypeError("profile_job_breakdown must be a boolean")
+        if not isinstance(dedup_before_primary, bool):
+            raise TypeError("dedup_before_primary must be a boolean")
         self.primary_tier: CPUOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
         self.profile_block_lookup = profile_block_lookup
         self.profile_job_breakdown = profile_job_breakdown
+        self.dedup_before_primary = dedup_before_primary
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -780,6 +789,29 @@ class TieringOffloadingManager(OffloadingManager):
         # This decrements ref_cnt on primary blocks that have been
         # successfully transferred to secondary tiers.
         self._maybe_process_finished_jobs()
+
+        # Step 1b: Drop blocks that every durable secondary tier already holds.
+        # keys_to_store drives the GPU→primary copy the caller is about to
+        # issue, so filtering here (rather than when cascading in
+        # complete_store) is what saves the copy itself, not just the write.
+        # A key is dropped only if *all* secondary tiers report it present;
+        # tiers that cannot answer keep it (filter_store_keys returns it).
+        if self.dedup_before_primary and self.secondary_tiers:
+            remaining: Collection[OffloadKey] = keys
+            for tier in self.secondary_tiers:
+                if not remaining:
+                    break
+                remaining = tier.filter_store_keys(remaining, req_context)
+            dropped = len(keys) - len(remaining)
+            if dropped:
+                self._record_secondary_tier_blocks(
+                    "store", "skipped_present_before_primary", dropped
+                )
+            if not remaining:
+                # Nothing left to copy: ask the primary for an empty result
+                # rather than building a store spec here.
+                return self.primary_tier.prepare_store([], req_context)
+            keys = remaining
 
         # Step 2: Store to primary tier (new blocks only).
         # Cascading of these newly-stored blocks to ALL secondary tiers

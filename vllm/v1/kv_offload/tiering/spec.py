@@ -149,6 +149,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 profile_block_lookup=bool(
                     self.extra_config.get("profile_block_lookup", False)
                 ),
+                # Skip the GPU->primary copy for blocks the secondary tiers
+                # already hold. Off by default: it only pays off for tiers
+                # that answer filter_store_keys from local metadata.
+                dedup_before_primary=bool(
+                    self.extra_config.get("dedup_before_primary", False)
+                ),
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
