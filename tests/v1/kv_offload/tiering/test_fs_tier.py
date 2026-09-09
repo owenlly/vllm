@@ -208,6 +208,38 @@ def test_store_creates_file_and_lookup_succeeds(fs_tier):
     assert os.path.exists(dest), f"Expected file at {dest}"
 
 
+def test_presence_dedup_filters_stored_keys(fs_tier):
+    tier, _ = fs_tier
+    # Nothing known yet: every key must be kept.
+    assert tier.filter_store_keys([key(1), key(2)], _CTX) == (key(1), key(2))
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    # key(1) is now known present; key(2) still has to be stored.
+    assert tier.filter_store_keys([key(1), key(2)], _CTX) == (key(2),)
+    assert tier.presence_skipped_blocks == 1
+    assert tier.lookup(key(1), _CTX) is True
+    # A LOAD publishes its keys too (it is only submitted after a lookup hit).
+    tier.submit_load(make_job(2, [key(1)], [1]))
+    drain(tier)
+    assert tier.filter_store_keys([key(1)], _CTX) == ()
+
+
+def test_presence_dedup_ignores_failed_store(fs_tier, tmp_path):
+    tier, _ = fs_tier
+    # Make the destination directory unwritable so the store fails.
+    dest = tier.file_mapper.get_file_name(key(7))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.chmod(os.path.dirname(dest), 0o500)
+    try:
+        tier.submit_store(make_job(3, [key(7)], [0]))
+        results = drain(tier)
+        assert len(results) == 1 and not results[0].success
+        assert tier.filter_store_keys([key(7)], _CTX) == (key(7),)
+    finally:
+        os.chmod(os.path.dirname(dest), 0o700)
+
+
 def test_quiesce_makes_submitted_jobs_reportable(fs_tier):
     tier, _ = fs_tier
     tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))

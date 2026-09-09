@@ -111,6 +111,19 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
+        # Scheduler-local presence: keys whose files are known to exist on
+        # this tier (a STORE job that completed successfully, or a LOAD, which
+        # is only submitted after lookup() saw the file). filter_store_keys()
+        # uses it to drop blocks that are already on disk before the tiering
+        # orchestrator pins primary blocks and copies them GPU -> primary ->
+        # here again; without it the only dedup is the exists() check inside
+        # the write task, after the copies have been paid for.
+        extra = getattr(offloading_spec, "extra_config", None) or {}
+        self._presence_dedup = bool(extra.get("fs_presence_dedup", True))
+        self._present: set[OffloadKey] = set()
+        self._store_job_keys: dict[int, tuple[OffloadKey, ...]] = {}
+        self._presence_skipped_blocks = 0
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -119,7 +132,26 @@ class FileSystemTierManager(SecondaryTierManager):
     def lookup(
         self, key: OffloadKey, req_context: ReqContext | None = None
     ) -> bool | None:
+        if key in self._present:
+            return True
         return os.path.exists(self.file_mapper.get_file_name(key))
+
+    @override
+    def filter_store_keys(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> tuple[OffloadKey, ...]:
+        if not self._presence_dedup or not self._present:
+            return tuple(keys)
+        kept = tuple(k for k in keys if k not in self._present)
+        self._presence_skipped_blocks += len(keys) - len(kept)
+        return kept
+
+    @property
+    def presence_skipped_blocks(self) -> int:
+        """Blocks filter_store_keys() dropped because they were already here."""
+        return self._presence_skipped_blocks
 
     @override
     def peek(self, key: OffloadKey) -> bool | None:
@@ -140,6 +172,7 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
+        self._store_job_keys[job_metadata.job_id] = tuple(job_metadata.keys)
         self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     @override
@@ -156,14 +189,22 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
+        # A LOAD is only submitted after lookup() found the file.
+        self._present.update(job_metadata.keys)
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
         """
-        Collect completed jobs from the finished-jobs queue.
+        Collect completed jobs from the finished-jobs queue and publish the
+        keys of successful STORE jobs as present.
         """
-        return self._pool.get_finished()
+        results = self._pool.get_finished()
+        for result in results:
+            keys = self._store_job_keys.pop(result.job_id, None)
+            if keys is not None and result.success:
+                self._present.update(keys)
+        return results
 
     @override
     def quiesce(self) -> None:
