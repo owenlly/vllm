@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 from vllm.v1.kv_offload.tiering.base import JobResult
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs.common import FusedFsLoadStoreSpec
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -1135,6 +1136,128 @@ class TestTieringOffloadingWithoutSecondaryTiers:
 
         manager.reset_cache()
         assert count_hits(manager, blocks) == 0
+
+
+def _fused_manager(num_blocks: int = 4):
+    """A tiering manager whose example secondary tier can serve fused LOADs."""
+    primary = _DPUPrimaryManager(num_blocks=num_blocks)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    secondary.fused_load_paths = lambda keys: tuple(f"/kv/{k!r}" for k in keys)
+    secondary.submit_load = MagicMock()
+    manager = TieringOffloadingManager(
+        primary, [secondary], fused_secondary_load=True
+    )
+    return manager, primary, secondary
+
+
+def test_fused_load_answers_ready_without_a_second_step():
+    """A secondary hit is schedulable now, not after a promotion round-trip."""
+    manager, primary, secondary = _fused_manager()
+    blocks = to_keys(range(2))
+    for block in blocks:
+        secondary.blocks[block] = True
+
+    # Without fusing this would be None ("promotion started, retry later").
+    assert manager.lookup(blocks[0], _CTX) is True
+    assert manager.lookup(blocks[1], _CTX) is True
+    # No secondary LOAD was submitted: the worker reads the bytes itself.
+    secondary.submit_load.assert_not_called()
+
+    # Asking again inside the same request stays ready rather than deferring
+    # on the reserved (ref_cnt=-1) primary slot.
+    assert manager.lookup(blocks[0], _CTX) is True
+
+    spec = manager.prepare_load(blocks, _CTX)
+    assert isinstance(spec, FusedFsLoadStoreSpec)
+    assert spec.block_ids.tolist() == [0, 1]
+    assert spec.fused_indices == (0, 1)
+    assert len(spec.fused_paths) == 2
+
+    # The blocks are only visible once the worker reports the LOAD landed.
+    assert primary.lookup(blocks[0], _CTX) is None
+    manager.complete_load(set(blocks), _CTX)
+    assert primary.lookup(blocks[0], _CTX) is True
+    assert primary.lookup(blocks[1], _CTX) is True
+
+
+def test_fused_load_mixes_reserved_and_resident_blocks():
+    """Blocks already in the primary tier keep the ordinary load path."""
+    manager, primary, secondary = _fused_manager()
+    resident, from_disk = to_keys(range(2))
+
+    out = manager.prepare_store([resident], _CTX)
+    assert out is not None
+    manager.complete_store([resident], _CTX, success=True)
+
+    secondary.blocks[from_disk] = True
+    assert manager.lookup(resident, _CTX) is True
+    assert manager.lookup(from_disk, _CTX) is True
+
+    spec = manager.prepare_load([resident, from_disk], _CTX)
+    assert isinstance(spec, FusedFsLoadStoreSpec)
+    # Only the second block still has to be read off the tier.
+    assert spec.fused_indices == (1,)
+    assert len(spec.block_ids) == 2
+
+
+def test_fused_load_failure_releases_the_reserved_slot():
+    """A failed LOAD must not publish a block the worker never filled."""
+    manager, primary, secondary = _fused_manager(num_blocks=2)
+    block = to_keys(range(1))[0]
+    secondary.blocks[block] = True
+
+    assert manager.lookup(block, _CTX) is True
+    manager.prepare_load([block], _CTX)
+    manager.abort_load({block}, _CTX)
+
+    # The slot is free again and the block is not readable.
+    assert primary.lookup(block, _CTX) is False
+
+
+def test_fused_load_releases_slots_when_a_request_ends_early():
+    """Reservations made at lookup time do not leak if the request goes away."""
+    manager, primary, secondary = _fused_manager(num_blocks=2)
+    block = to_keys(range(1))[0]
+    secondary.blocks[block] = True
+
+    assert manager.lookup(block, _CTX) is True
+    # The request is aborted before prepare_load() is ever reached.
+    manager.on_request_finished(_CTX)
+
+    assert primary.lookup(block, _CTX) is False
+    # The freed slot can be handed out again.
+    assert manager.lookup(block, _CTX) is True
+
+
+def test_fused_load_off_by_default_keeps_the_two_step_promotion():
+    """The default path still defers and submits a secondary LOAD."""
+    primary = _DPUPrimaryManager(num_blocks=4)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    manager = TieringOffloadingManager(primary, [secondary])
+    block = to_keys(range(1))[0]
+    secondary.blocks[block] = True
+
+    assert manager.lookup(block, _CTX) is None
+
+
+def test_fused_load_requires_tiers_that_can_resolve_paths():
+    """A tier that cannot name its files is rejected at construction."""
+    primary = _DPUPrimaryManager(num_blocks=2)
+    secondary = SecondaryTierFactory.create_secondary_tier(
+        tier_config={"type": "example"},
+        primary_kv_view=None,
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+    )
+    with pytest.raises(TypeError, match="fused_load_paths"):
+        TieringOffloadingManager(primary, [secondary], fused_secondary_load=True)
 
 
 if __name__ == "__main__":

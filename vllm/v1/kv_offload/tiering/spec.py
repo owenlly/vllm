@@ -31,21 +31,31 @@ Example configuration:
 }
 """
 
+from collections.abc import Iterator
+
 import torch
 from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingManager,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs.common import FusedFsLoadStoreSpec
+from vllm.v1.kv_offload.tiering.fs.gpu_worker import FsGpuOffloadingHandler
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
+from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 logger = init_logger(__name__)
 
@@ -77,6 +87,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
+
+        # Fuse the secondary-tier read into the GPU copy, so a secondary hit
+        # does not cost the request an extra scheduler step.
+        self.fused_secondary_load = bool(
+            self.extra_config.get("fused_secondary_load", False)
+        )
+        self.fused_load_read_threads = int(
+            self.extra_config.get("fused_load_read_threads", 8)
+        )
+        # Worker-side mmap, captured in create_handlers() so get_handlers()
+        # can hand the fused reader this rank's column.
+        self._worker_mmap: SharedOffloadRegion | None = None
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -155,6 +177,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 dedup_before_primary=bool(
                     self.extra_config.get("dedup_before_primary", False)
                 ),
+                # Answer a secondary hit with "ready" and let the worker do
+                # the disk read and the GPU copy in one job, instead of
+                # deferring the request for a scheduler step while the block
+                # is promoted into the primary tier.
+                fused_secondary_load=self.fused_secondary_load,
             )
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
@@ -182,9 +209,42 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
             cpu_page_size=self.cpu_page_size_per_worker,
         )
+        self._worker_mmap = worker_mmap
         return CpuGpuOffloadingHandlers(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             mmap_region=worker_mmap,
+        )
+
+    @override
+    def get_handlers(
+        self, kv_caches: CanonicalKVCaches
+    ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
+        """Register the GPU↔primary handlers, plus the fused reader if enabled.
+
+        The fused handler wraps the primary→GPU handler, so both the plain
+        CPU→GPU route and the fused route stay available; which one a LOAD
+        takes is decided by the spec the scheduler emits.
+        """
+        yield from super().get_handlers(kv_caches)
+
+        if not self.fused_secondary_load:
+            return
+
+        worker_mmap = self._worker_mmap
+        assert worker_mmap is not None and worker_mmap.rank is not None
+        assert self._handlers is not None
+        cpu_page_size = self.cpu_page_size_per_worker
+        yield (
+            FusedFsLoadStoreSpec,
+            GPULoadStoreSpec,
+            FsGpuOffloadingHandler(
+                cpu_to_gpu_handler=self._handlers.cpu_to_gpu_handler,
+                base_view=memoryview(worker_mmap.mmap_obj),
+                row_stride=self.kv_bytes_per_offloaded_block,
+                worker_offset=worker_mmap.rank * cpu_page_size,
+                worker_length=cpu_page_size,
+                num_threads=self.fused_load_read_threads,
+            ),
         )

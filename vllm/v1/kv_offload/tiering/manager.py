@@ -43,6 +43,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.tiering.fs.common import FusedFsLoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
@@ -140,6 +141,7 @@ class TieringOffloadingManager(OffloadingManager):
         profile_block_lookup: bool = False,
         profile_job_breakdown: bool = True,
         dedup_before_primary: bool = False,
+        fused_secondary_load: bool = False,
     ):
         """
         Initialize the TieringOffloadingManager.
@@ -157,6 +159,12 @@ class TieringOffloadingManager(OffloadingManager):
                 so blocks that are already durable are never copied from the
                 GPU. Only tiers whose filter_store_keys answers from local
                 metadata benefit; the default keeps the original behavior.
+            fused_secondary_load: Answer a secondary-tier hit with "ready"
+                instead of "retry later", and let the worker do the disk read
+                and the GPU copy in one job. This removes the scheduler step
+                a promotion otherwise waits for. Requires every secondary tier
+                to expose fused_load_paths(); the default keeps the original
+                two-step promotion.
         """
         if not isinstance(profile_block_lookup, bool):
             raise TypeError("profile_block_lookup must be a boolean")
@@ -164,11 +172,34 @@ class TieringOffloadingManager(OffloadingManager):
             raise TypeError("profile_job_breakdown must be a boolean")
         if not isinstance(dedup_before_primary, bool):
             raise TypeError("dedup_before_primary must be a boolean")
+        if not isinstance(fused_secondary_load, bool):
+            raise TypeError("fused_secondary_load must be a boolean")
         self.primary_tier: CPUOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
         self.profile_block_lookup = profile_block_lookup
         self.profile_job_breakdown = profile_job_breakdown
         self.dedup_before_primary = dedup_before_primary
+        self.fused_secondary_load = fused_secondary_load
+        if fused_secondary_load:
+            for tier in self.secondary_tiers:
+                if not hasattr(tier, "fused_load_paths"):
+                    raise TypeError(
+                        "fused_secondary_load requires every secondary tier to "
+                        f"implement fused_load_paths(); {type(tier).__name__} "
+                        "does not"
+                    )
+
+        # Blocks whose primary slot was reserved at lookup time and whose bytes
+        # the worker still has to read. req_id -> {key: primary block ID}.
+        self._fused_load_reservations: dict[str, dict[OffloadKey, int]] = {}
+        # Reservations handed to a worker, keyed by the job's identity, so that
+        # complete_load/abort_load can publish or release the primary slots.
+        self._pending_fused_loads: dict[
+            tuple[str, frozenset[OffloadKey]], tuple[OffloadKey, ...]
+        ] = {}
+        # Which tier each reserved key is read from, so prepare_load() can ask
+        # the right tier for its paths.
+        self._fused_load_tiers: dict[OffloadKey, SecondaryTierManager] = {}
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -542,6 +573,17 @@ class TieringOffloadingManager(OffloadingManager):
         try:
             self._maybe_process_finished_jobs()
 
+            if self.fused_secondary_load:
+                # A slot reserved earlier in this request is still ref_cnt=-1,
+                # so primary.lookup() would call it in-flight and defer the
+                # request — exactly the wait fusing is meant to remove.
+                reserved = self._fused_load_reservations.get(req_context.req_id)
+                if reserved is not None and key in reserved:
+                    self._record_tiering_lookup_result(
+                        "fused_secondary_reserved_ready"
+                    )
+                    return True
+
             primary_wall_start = time.perf_counter() if profile_lookup else 0.0
             primary_cpu_start = time.thread_time() if profile_lookup else 0.0
             try:
@@ -582,6 +624,20 @@ class TieringOffloadingManager(OffloadingManager):
 
                 self._record_tiering_lookup_result("secondary_lookup")
                 if result is True:
+                    if self.fused_secondary_load:
+                        if not self._reserve_fused_load(tier, key, req_context):
+                            self._record_tiering_lookup_result(
+                                "secondary_hit_but_no_primary_slot"
+                            )
+                            return False  # primary full, block unavailable
+                        # "Ready" here means the fused LOAD has a source and a
+                        # reserved primary slot, so the scheduler can issue it
+                        # now. The KV bytes are not in DRAM yet; the worker
+                        # reads them before the GPU copy.
+                        self._record_tiering_lookup_result(
+                            "secondary_hit_fused_ready"
+                        )
+                        return True
                     if not self._initiate_promotion(tier, key, req_context):
                         self._record_tiering_lookup_result(
                             "secondary_hit_but_no_primary_slot"
@@ -683,6 +739,46 @@ class TieringOffloadingManager(OffloadingManager):
         entry.block_ids.extend(store_spec.block_ids)
         return True
 
+    def _reserve_fused_load(
+        self,
+        tier: SecondaryTierManager,
+        key: OffloadKey,
+        req_context: ReqContext,
+    ) -> bool:
+        """Reserve a primary slot for a block the worker will read itself.
+
+        Unlike _initiate_promotion this submits no secondary-tier LOAD: the
+        bytes are read on the worker as part of the GPU copy. The slot is
+        allocated here (ref_cnt=-1) so it cannot be evicted before the worker
+        fills it, and is published in complete_load() or released in
+        abort_load().
+
+        Returns:
+            True if a slot was reserved, False if the primary tier is full.
+        """
+        primary_write_result = self.primary_tier.prepare_store([key], req_context)
+        if primary_write_result is None:
+            return False
+
+        store_spec = primary_write_result.store_spec
+        assert isinstance(store_spec, BlockIDsLoadStoreSpec)
+        block_ids = store_spec.block_ids
+        if len(block_ids) != 1:
+            raise RuntimeError(
+                "fused LOAD reservation returned more than one primary block"
+            )
+        self._record_primary_eviction(
+            "fused_load", len(primary_write_result.evicted_keys)
+        )
+        reservations = self._fused_load_reservations.setdefault(
+            req_context.req_id, {}
+        )
+        if key in reservations:
+            raise RuntimeError("fused LOAD key was reserved twice")
+        reservations[key] = int(block_ids[0])
+        self._fused_load_tiers[key] = tier
+        return True
+
     def _flush_pending_promotions(self) -> None:
         """Submit one batched submit_load() per (tier, request).
 
@@ -734,7 +830,57 @@ class TieringOffloadingManager(OffloadingManager):
         # Process completed promotions to ensure blocks are ready
         self._maybe_process_finished_jobs()
 
-        return self.primary_tier.prepare_load(keys, req_context)
+        if not self.fused_secondary_load:
+            return self.primary_tier.prepare_load(keys, req_context)
+
+        immutable_keys = tuple(keys)
+        reservations = self._fused_load_reservations.get(req_context.req_id, {})
+        fused_keys = tuple(key for key in immutable_keys if key in reservations)
+        resident_keys = tuple(
+            key for key in immutable_keys if key not in reservations
+        )
+
+        # Resident blocks still need their ref_cnt raised for the transfer;
+        # reserved blocks are already protected at ref_cnt=-1.
+        resident_spec = self.primary_tier.prepare_load(resident_keys, req_context)
+        if not isinstance(resident_spec, BlockIDsLoadStoreSpec):
+            raise TypeError("primary tier returned invalid LOAD metadata")
+        resident_ids = {
+            key: int(block_id)
+            for key, block_id in zip(resident_keys, resident_spec.block_ids)
+        }
+
+        block_ids = [
+            reservations[key] if key in reservations else resident_ids[key]
+            for key in immutable_keys
+        ]
+        fused_positions = tuple(
+            index
+            for index, key in enumerate(immutable_keys)
+            if key in reservations
+        )
+        fused_paths: tuple[str, ...] = ()
+        if fused_keys:
+            paths_by_tier: dict[SecondaryTierManager, list[OffloadKey]] = {}
+            for key in fused_keys:
+                paths_by_tier.setdefault(self._fused_load_tiers[key], []).append(key)
+            resolved: dict[OffloadKey, str] = {}
+            for tier, tier_keys in paths_by_tier.items():
+                for key, path in zip(tier_keys, tier.fused_load_paths(tier_keys)):
+                    resolved[key] = path
+            fused_paths = tuple(resolved[key] for key in fused_keys)
+
+        identity = (req_context.req_id, frozenset(immutable_keys))
+        if identity in self._pending_fused_loads:
+            raise ValueError("duplicate pending fused LOAD")
+        self._pending_fused_loads[identity] = fused_keys
+        for key in fused_keys:
+            del reservations[key]
+            self._fused_load_tiers.pop(key, None)
+        if not reservations:
+            self._fused_load_reservations.pop(req_context.req_id, None)
+
+        return FusedFsLoadStoreSpec(block_ids, fused_positions, fused_paths)
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -761,7 +907,50 @@ class TieringOffloadingManager(OffloadingManager):
             keys: Blocks that finished loading.
             req_context: Per-request context.
         """
+        if self.fused_secondary_load:
+            self._finish_fused_load(keys, req_context, success=True)
+            return
         self.primary_tier.complete_load(keys, req_context)
+
+    @override
+    def abort_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """Release the primary slots a failed LOAD was holding.
+
+        Blocks the worker was going to fill still sit at ref_cnt=-1 with no
+        valid contents, so they are dropped rather than published.
+        """
+        if self.fused_secondary_load:
+            self._finish_fused_load(keys, req_context, success=False)
+            return
+        self.primary_tier.complete_load(keys, req_context)
+
+    def _finish_fused_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool,
+    ) -> None:
+        """Settle one fused LOAD: publish or drop what the worker was filling.
+
+        Blocks that were already resident just drop their ref_cnt. Blocks whose
+        slot this manager reserved at lookup time move from ref_cnt=-1 to
+        visible on success, and are freed on failure.
+        """
+        immutable_keys = tuple(keys)
+        identity = (req_context.req_id, frozenset(immutable_keys))
+        fused_keys = self._pending_fused_loads.pop(identity, ())
+        fused_set = set(fused_keys)
+        resident_keys = [key for key in immutable_keys if key not in fused_set]
+
+        if resident_keys:
+            self.primary_tier.complete_load(resident_keys, req_context)
+        if fused_keys:
+            self.primary_tier.complete_store(fused_keys, req_context, success)
+            self._record_secondary_tier_blocks(
+                "load",
+                "fused_published" if success else "fused_failed",
+                len(fused_keys),
+            )
 
     @override
     def prepare_store(
@@ -976,6 +1165,19 @@ class TieringOffloadingManager(OffloadingManager):
             tier.on_request_finished(req_context)
         self._request_level_tiers.pop(req_context.req_id, None)
         self._completed_promotion_timings.pop(req_context.req_id, None)
+        # A request can end between lookup() and prepare_load() (preemption, an
+        # abort, or a later block missing). Slots reserved for it are still at
+        # ref_cnt=-1 and would leak, so release them here.
+        stranded = self._fused_load_reservations.pop(req_context.req_id, None)
+        if stranded:
+            self.primary_tier.complete_store(
+                tuple(stranded), req_context, False
+            )
+            for key in stranded:
+                self._fused_load_tiers.pop(key, None)
+            self._record_secondary_tier_blocks(
+                "load", "fused_reservation_stranded", len(stranded)
+            )
 
     @override
     def on_schedule_end(self) -> None:

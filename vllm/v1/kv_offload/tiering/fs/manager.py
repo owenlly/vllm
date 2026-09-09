@@ -153,6 +153,17 @@ class FileSystemTierManager(SecondaryTierManager):
         """Blocks filter_store_keys() dropped because they were already here."""
         return self._presence_skipped_blocks
 
+    def fused_load_paths(
+        self, keys: Collection[OffloadKey]
+    ) -> tuple[str, ...]:
+        """Resolve the files a worker will read for a fused LOAD.
+
+        The scheduler owns the FileMapper, so it resolves the paths and ships
+        them in the LOAD spec rather than making every worker map keys itself.
+        The keys were seen by lookup(), so their files exist.
+        """
+        return tuple(self.file_mapper.get_file_name(key) for key in keys)
+
     @override
     def peek(self, key: OffloadKey) -> bool | None:
         # lookup() on this tier is already a side-effect-free stat().
