@@ -261,10 +261,13 @@ class TestTieringOffloadingManager:
             tier_type="example",
         )
 
-        # Create tiered manager
+        # Create tiered manager. Lookup runtime profiling is off by default in
+        # production; these tests assert on the per-tier wall/CPU stats, and
+        # one of them turns it back off explicitly.
         self.manager = TieringOffloadingManager(
             primary_tier=self.primary_tier,
             secondary_tiers=[self.secondary_tier1, self.secondary_tier2],
+            profile_block_lookup=True,
         )
 
     def _simulate_on_schedule_end(self):
