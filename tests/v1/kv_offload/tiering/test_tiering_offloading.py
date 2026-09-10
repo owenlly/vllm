@@ -1207,6 +1207,59 @@ def test_fused_load_mixes_reserved_and_resident_blocks():
     assert len(spec.block_ids) == 2
 
 
+def test_fused_load_pins_resident_blocks_against_later_reservations():
+    """A reservation for a later block must not evict an earlier ready one.
+
+    Regression: lookup() answered "ready" for a resident block without pinning
+    it, so reserving a slot for the next block in the same prefix could evict
+    it, and prepare_load() then asserted "Block not found in cache".
+    """
+    # Exactly one slot: the reservation is forced to evict something.
+    manager, primary, secondary = _fused_manager(num_blocks=1)
+    resident, from_disk = to_keys(range(2))
+
+    out = manager.prepare_store([resident], _CTX)
+    assert out is not None
+    manager.complete_store([resident], _CTX, success=True)
+
+    secondary.blocks[from_disk] = True
+    assert manager.lookup(resident, _CTX) is True
+    # The only slot is taken by a pinned block, so this cannot be reserved.
+    assert manager.lookup(from_disk, _CTX) is False
+
+    # The resident block survived and is still loadable.
+    spec = manager.prepare_load([resident], _CTX)
+    assert isinstance(spec, FusedFsLoadStoreSpec)
+    assert spec.fused_indices == ()
+    manager.complete_load({resident}, _CTX)
+
+
+def test_fused_load_releases_pins_when_a_request_ends_early():
+    """Pins taken at lookup time are dropped if no LOAD ever claims them."""
+    manager, primary, secondary = _fused_manager(num_blocks=1)
+    resident = to_keys(range(1))[0]
+
+    out = manager.prepare_store([resident], _CTX)
+    assert out is not None
+    manager.complete_store([resident], _CTX, success=True)
+    baseline = primary._policy.get(resident).ref_cnt
+
+    # Answering "ready" raises ref_cnt so a later reservation cannot evict it.
+    assert manager.lookup(resident, _CTX) is True
+    assert primary._policy.get(resident).ref_cnt == baseline + 1
+
+    # The request dies before prepare_load(); the pin must not leak.
+    manager.on_request_finished(_CTX)
+    assert primary._policy.get(resident).ref_cnt == baseline
+
+    # Repeated lookups within one request pin only once.
+    assert manager.lookup(resident, _CTX) is True
+    assert manager.lookup(resident, _CTX) is True
+    assert primary._policy.get(resident).ref_cnt == baseline + 1
+    manager.on_request_finished(_CTX)
+    assert primary._policy.get(resident).ref_cnt == baseline
+
+
 def test_fused_load_failure_releases_the_reserved_slot():
     """A failed LOAD must not publish a block the worker never filled."""
     manager, primary, secondary = _fused_manager(num_blocks=2)
