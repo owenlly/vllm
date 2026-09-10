@@ -200,10 +200,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Which tier each reserved key is read from, so prepare_load() can ask
         # the right tier for its paths.
         self._fused_load_tiers: dict[OffloadKey, SecondaryTierManager] = {}
-        # Blocks already in the primary tier that lookup() called ready and
-        # pinned (ref_cnt+1), so a later reservation in the same request cannot
-        # evict them. req_id -> {key: primary block ID}.
-        self._fused_load_resident_pins: dict[str, dict[OffloadKey, int]] = {}
+        # Blocks already in the primary tier that lookup() reported ready for a
+        # request. Passing them to prepare_store() when reserving a slot for a
+        # later block puts them in its `protected` set, so the request cannot
+        # evict what it was just promised. This costs no ref_cnt: raising one
+        # per hit exhausts the primary tier's few thousand blocks under load.
+        self._fused_load_resident_hits: dict[str, list[OffloadKey]] = {}
 
         self._job_id_counter: int = 0
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -603,12 +605,17 @@ class TieringOffloadingManager(OffloadingManager):
             self._record_tiering_lookup_result("cpu_lookup")
             if primary_hit is True:
                 if self.fused_secondary_load:
-                    # Pin it now. Answering "ready" lets the caller keep walking
-                    # the prefix, and reserving a slot for a later block can
-                    # evict this one before prepare_load() ever asks for it.
-                    # The two-step path never hit this: a secondary hit deferred
-                    # the request and the whole lookup sequence restarted.
-                    self._pin_resident_for_fused_load(key, req_context)
+                    # Remember it. Answering "ready" lets the caller keep
+                    # walking the prefix, and reserving a slot for a later
+                    # block would otherwise evict this one before
+                    # prepare_load() asks for it. The two-step path never hit
+                    # this: a secondary hit deferred the request and the whole
+                    # lookup sequence restarted.
+                    hits = self._fused_load_resident_hits.setdefault(
+                        req_context.req_id, []
+                    )
+                    if key not in hits:
+                        hits.append(key)
                 self._record_tiering_lookup_result("cpu_hit_ready")
                 return True
             if primary_hit is None:
@@ -750,26 +757,6 @@ class TieringOffloadingManager(OffloadingManager):
         entry.block_ids.extend(store_spec.block_ids)
         return True
 
-    def _pin_resident_for_fused_load(
-        self, key: OffloadKey, req_context: ReqContext
-    ) -> None:
-        """Raise ref_cnt on a block lookup() just reported as ready.
-
-        Idempotent per request: a repeated lookup of the same key must not
-        stack ref_cnt, because prepare_load()/complete_load() only settle it
-        once.
-        """
-        pins = self._fused_load_resident_pins.setdefault(req_context.req_id, {})
-        if key in pins:
-            return
-        spec = self.primary_tier.prepare_load([key], req_context)
-        if not isinstance(spec, BlockIDsLoadStoreSpec):
-            raise TypeError("primary tier returned invalid LOAD metadata")
-        block_ids = spec.block_ids
-        if len(block_ids) != 1:
-            raise RuntimeError("primary lookup-time pin returned invalid block IDs")
-        pins[key] = int(block_ids[0])
-
     def _reserve_fused_load(
         self,
         tier: SecondaryTierManager,
@@ -784,19 +771,34 @@ class TieringOffloadingManager(OffloadingManager):
         fills it, and is published in complete_load() or released in
         abort_load().
 
+        Blocks this request has already been told are ready ride along in the
+        request: prepare_store() skips the ones already cached but still puts
+        them in its `protected` set, so making room here cannot evict what the
+        caller was just promised.
+
         Returns:
             True if a slot was reserved, False if the primary tier is full.
         """
-        primary_write_result = self.primary_tier.prepare_store([key], req_context)
+        # Only blocks still resident may ride along: one evicted by another
+        # request would land in keys_to_store and get a slot nobody owns.
+        # peek() has no side effects, unlike lookup().
+        resident_hits = tuple(
+            hit
+            for hit in self._fused_load_resident_hits.get(req_context.req_id, ())
+            if self.primary_tier.peek(hit)
+        )
+        primary_write_result = self.primary_tier.prepare_store(
+            [key, *resident_hits], req_context
+        )
         if primary_write_result is None:
             return False
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, BlockIDsLoadStoreSpec)
         block_ids = store_spec.block_ids
-        if len(block_ids) != 1:
+        if len(block_ids) != 1 or list(primary_write_result.keys_to_store) != [key]:
             raise RuntimeError(
-                "fused LOAD reservation returned more than one primary block"
+                "fused LOAD reservation did not allocate exactly the new block"
             )
         self._record_primary_eviction(
             "fused_load", len(primary_write_result.evicted_keys)
@@ -866,24 +868,25 @@ class TieringOffloadingManager(OffloadingManager):
 
         immutable_keys = tuple(keys)
         reservations = self._fused_load_reservations.get(req_context.req_id, {})
-        pins = self._fused_load_resident_pins.get(req_context.req_id, {})
         fused_keys = tuple(key for key in immutable_keys if key in reservations)
         resident_keys = tuple(
             key for key in immutable_keys if key not in reservations
         )
 
-        # Resident blocks were pinned (ref_cnt raised) when lookup() reported
-        # them ready; reserved blocks are protected at ref_cnt=-1. Neither may
-        # be looked up again here: a later reservation can evict an unpinned
-        # block, and primary_tier.prepare_load() asserts on a missing block.
-        missing = tuple(key for key in resident_keys if key not in pins)
-        if missing:
-            raise RuntimeError(
-                "fused LOAD has resident keys without a lookup-time pin"
-            )
+        # Resident blocks take the ordinary path: this request's reservations
+        # could not evict them (they rode along in prepare_store's protected
+        # set), so they are still here and prepare_load raises their ref_cnt
+        # for the transfer. Reserved blocks are already held at ref_cnt=-1.
+        resident_spec = self.primary_tier.prepare_load(resident_keys, req_context)
+        if not isinstance(resident_spec, BlockIDsLoadStoreSpec):
+            raise TypeError("primary tier returned invalid LOAD metadata")
+        resident_ids = {
+            key: int(block_id)
+            for key, block_id in zip(resident_keys, resident_spec.block_ids)
+        }
 
         block_ids = [
-            reservations[key] if key in reservations else pins[key]
+            reservations[key] if key in reservations else resident_ids[key]
             for key in immutable_keys
         ]
         fused_positions = tuple(
@@ -911,13 +914,9 @@ class TieringOffloadingManager(OffloadingManager):
             self._fused_load_tiers.pop(key, None)
         if not reservations:
             self._fused_load_reservations.pop(req_context.req_id, None)
-        # This LOAD now owns the resident blocks' ref_cnt; complete_load() or
-        # abort_load() drops it. Anything still pinned afterwards was never
-        # loaded and is released in on_request_finished().
-        for key in resident_keys:
-            del pins[key]
-        if not pins:
-            self._fused_load_resident_pins.pop(req_context.req_id, None)
+        # The recorded hits only ever fed prepare_store's protected set; this
+        # LOAD now holds the real ref_cnt, so drop the bookkeeping.
+        self._fused_load_resident_hits.pop(req_context.req_id, None)
 
         return FusedFsLoadStoreSpec(block_ids, fused_positions, fused_paths)
 
@@ -1217,14 +1216,8 @@ class TieringOffloadingManager(OffloadingManager):
             self._record_secondary_tier_blocks(
                 "load", "fused_reservation_stranded", len(stranded)
             )
-        # Same for blocks pinned at lookup time that no LOAD ever claimed:
-        # their ref_cnt is still raised and would pin the slot forever.
-        stranded_pins = self._fused_load_resident_pins.pop(req_context.req_id, None)
-        if stranded_pins:
-            self.primary_tier.complete_load(tuple(stranded_pins), req_context)
-            self._record_secondary_tier_blocks(
-                "load", "fused_pin_stranded", len(stranded_pins)
-            )
+        # Recorded hits hold no ref_cnt, so they just need forgetting.
+        self._fused_load_resident_hits.pop(req_context.req_id, None)
 
     @override
     def on_schedule_end(self) -> None:
@@ -1237,33 +1230,12 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
         self._processed_jobs_this_step = False
         self._flush_pending_promotions()
-        self._release_unclaimed_fused_pins()
+        # Hits only guard a request against its own reservations, which happen
+        # in the same step. Keeping them longer would protect blocks from
+        # eviction across steps and slowly freeze the primary tier.
+        self._fused_load_resident_hits.clear()
         for tier in self.secondary_tiers:
             tier.on_schedule_end()
-
-    def _release_unclaimed_fused_pins(self) -> None:
-        """Drop lookup-time pins that no LOAD claimed during this step.
-
-        A pin only has to survive from lookup() to prepare_load(), which the
-        scheduler does inside one step. Holding them longer starves the primary
-        tier: it has a few thousand blocks, and at high concurrency the pins
-        from requests that did not reach prepare_load() pile up until nothing
-        is evictable. A request that comes back next step looks its blocks up
-        again and re-pins them.
-        """
-        if not self._fused_load_resident_pins:
-            return
-        released = 0
-        for req_id, pins in self._fused_load_resident_pins.items():
-            if not pins:
-                continue
-            self.primary_tier.complete_load(tuple(pins), ReqContext(req_id=req_id))
-            released += len(pins)
-        self._fused_load_resident_pins.clear()
-        if released:
-            self._record_secondary_tier_blocks(
-                "load", "fused_pin_released_at_step_end", released
-            )
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

@@ -1207,14 +1207,16 @@ def test_fused_load_mixes_reserved_and_resident_blocks():
     assert len(spec.block_ids) == 2
 
 
-def test_fused_load_pins_resident_blocks_against_later_reservations():
+def test_fused_load_protects_resident_hits_from_its_own_reservations():
     """A reservation for a later block must not evict an earlier ready one.
 
-    Regression: lookup() answered "ready" for a resident block without pinning
-    it, so reserving a slot for the next block in the same prefix could evict
-    it, and prepare_load() then asserted "Block not found in cache".
+    Regression: lookup() answered "ready" for a resident block, and reserving
+    a slot for the next block in the same prefix could evict it, so
+    prepare_load() hit the primary tier's "Block not found in cache" assert.
+    The hits ride along in prepare_store(), which puts them in its protected
+    set without touching ref_cnt.
     """
-    # Exactly one slot: the reservation is forced to evict something.
+    # Exactly one slot: the reservation is forced to look for a victim.
     manager, primary, secondary = _fused_manager(num_blocks=1)
     resident, from_disk = to_keys(range(2))
 
@@ -1224,7 +1226,7 @@ def test_fused_load_pins_resident_blocks_against_later_reservations():
 
     secondary.blocks[from_disk] = True
     assert manager.lookup(resident, _CTX) is True
-    # The only slot is taken by a pinned block, so this cannot be reserved.
+    # The only slot holds a protected block, so this cannot be reserved.
     assert manager.lookup(from_disk, _CTX) is False
 
     # The resident block survived and is still loadable.
@@ -1234,39 +1236,12 @@ def test_fused_load_pins_resident_blocks_against_later_reservations():
     manager.complete_load({resident}, _CTX)
 
 
-def test_fused_load_releases_pins_when_a_request_ends_early():
-    """Pins taken at lookup time are dropped if no LOAD ever claims them."""
-    manager, primary, secondary = _fused_manager(num_blocks=1)
-    resident = to_keys(range(1))[0]
+def test_fused_load_resident_hits_take_no_ref_cnt():
+    """Recording a hit must not raise ref_cnt.
 
-    out = manager.prepare_store([resident], _CTX)
-    assert out is not None
-    manager.complete_store([resident], _CTX, success=True)
-    baseline = primary._policy.get(resident).ref_cnt
-
-    # Answering "ready" raises ref_cnt so a later reservation cannot evict it.
-    assert manager.lookup(resident, _CTX) is True
-    assert primary._policy.get(resident).ref_cnt == baseline + 1
-
-    # The request dies before prepare_load(); the pin must not leak.
-    manager.on_request_finished(_CTX)
-    assert primary._policy.get(resident).ref_cnt == baseline
-
-    # Repeated lookups within one request pin only once.
-    assert manager.lookup(resident, _CTX) is True
-    assert manager.lookup(resident, _CTX) is True
-    assert primary._policy.get(resident).ref_cnt == baseline + 1
-    manager.on_request_finished(_CTX)
-    assert primary._policy.get(resident).ref_cnt == baseline
-
-
-def test_fused_load_pins_do_not_survive_the_scheduler_step():
-    """Pins are dropped at step end so they cannot starve the primary tier.
-
-    A pin only has to bridge lookup() to prepare_load(), which happens inside
-    one scheduler step. Holding them across steps let unclaimed pins pile up
-    until nothing in the primary tier was evictable, which collapsed the hit
-    rate and re-offloaded everything.
+    Raising one per hit exhausted the primary tier under load: nothing stayed
+    evictable, the hit rate collapsed and a SWE replay re-offloaded 116 TB
+    instead of 1.07 TB.
     """
     manager, primary, secondary = _fused_manager(num_blocks=2)
     resident = to_keys(range(1))[0]
@@ -1274,44 +1249,35 @@ def test_fused_load_pins_do_not_survive_the_scheduler_step():
     out = manager.prepare_store([resident], _CTX)
     assert out is not None
     manager.complete_store([resident], _CTX, success=True)
-    # Let the cascade to the secondary tier land first: while it is in flight
-    # it holds a ref_cnt of its own, which would make the baseline unstable.
-    # Twice, because the first call is swallowed by the once-per-step gate.
+    # Twice: the first call is swallowed by the once-per-step gate.
     manager.on_schedule_end()
     manager.on_schedule_end()
     baseline = primary._policy.get(resident).ref_cnt
 
     assert manager.lookup(resident, _CTX) is True
-    assert primary._policy.get(resident).ref_cnt == baseline + 1
-
-    # The request never reached prepare_load() this step.
-    manager.on_schedule_end()
-    assert primary._policy.get(resident).ref_cnt == baseline
-    assert not manager._fused_load_resident_pins
-
-    # Next step the request looks it up again and re-pins it.
     assert manager.lookup(resident, _CTX) is True
+    assert primary._policy.get(resident).ref_cnt == baseline
+
+    # prepare_load() is what takes the reference, and complete_load returns it.
+    manager.prepare_load([resident], _CTX)
     assert primary._policy.get(resident).ref_cnt == baseline + 1
+    manager.complete_load({resident}, _CTX)
+    assert primary._policy.get(resident).ref_cnt == baseline
 
 
-def test_fused_load_step_end_keeps_pins_claimed_by_a_load():
-    """A pin consumed by prepare_load() is owned by that LOAD, not the step."""
+def test_fused_load_resident_hits_do_not_outlive_the_step():
+    """Hits are forgotten at step end so they cannot freeze the tier."""
     manager, primary, secondary = _fused_manager(num_blocks=2)
     resident = to_keys(range(1))[0]
 
     out = manager.prepare_store([resident], _CTX)
     assert out is not None
     manager.complete_store([resident], _CTX, success=True)
-    baseline = primary._policy.get(resident).ref_cnt
 
     assert manager.lookup(resident, _CTX) is True
-    manager.prepare_load([resident], _CTX)
-    # prepare_load() took ownership, so step end must not drop the ref_cnt.
+    assert manager._fused_load_resident_hits
     manager.on_schedule_end()
-    assert primary._policy.get(resident).ref_cnt == baseline + 1
-
-    manager.complete_load({resident}, _CTX)
-    assert primary._policy.get(resident).ref_cnt == baseline
+    assert not manager._fused_load_resident_hits
 
 
 def test_fused_load_failure_releases_the_reserved_slot():
