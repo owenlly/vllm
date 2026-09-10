@@ -1237,8 +1237,33 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
         self._processed_jobs_this_step = False
         self._flush_pending_promotions()
+        self._release_unclaimed_fused_pins()
         for tier in self.secondary_tiers:
             tier.on_schedule_end()
+
+    def _release_unclaimed_fused_pins(self) -> None:
+        """Drop lookup-time pins that no LOAD claimed during this step.
+
+        A pin only has to survive from lookup() to prepare_load(), which the
+        scheduler does inside one step. Holding them longer starves the primary
+        tier: it has a few thousand blocks, and at high concurrency the pins
+        from requests that did not reach prepare_load() pile up until nothing
+        is evictable. A request that comes back next step looks its blocks up
+        again and re-pins them.
+        """
+        if not self._fused_load_resident_pins:
+            return
+        released = 0
+        for req_id, pins in self._fused_load_resident_pins.items():
+            if not pins:
+                continue
+            self.primary_tier.complete_load(tuple(pins), ReqContext(req_id=req_id))
+            released += len(pins)
+        self._fused_load_resident_pins.clear()
+        if released:
+            self._record_secondary_tier_blocks(
+                "load", "fused_pin_released_at_step_end", released
+            )
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

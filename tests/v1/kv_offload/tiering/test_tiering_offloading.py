@@ -1260,6 +1260,60 @@ def test_fused_load_releases_pins_when_a_request_ends_early():
     assert primary._policy.get(resident).ref_cnt == baseline
 
 
+def test_fused_load_pins_do_not_survive_the_scheduler_step():
+    """Pins are dropped at step end so they cannot starve the primary tier.
+
+    A pin only has to bridge lookup() to prepare_load(), which happens inside
+    one scheduler step. Holding them across steps let unclaimed pins pile up
+    until nothing in the primary tier was evictable, which collapsed the hit
+    rate and re-offloaded everything.
+    """
+    manager, primary, secondary = _fused_manager(num_blocks=2)
+    resident = to_keys(range(1))[0]
+
+    out = manager.prepare_store([resident], _CTX)
+    assert out is not None
+    manager.complete_store([resident], _CTX, success=True)
+    # Let the cascade to the secondary tier land first: while it is in flight
+    # it holds a ref_cnt of its own, which would make the baseline unstable.
+    # Twice, because the first call is swallowed by the once-per-step gate.
+    manager.on_schedule_end()
+    manager.on_schedule_end()
+    baseline = primary._policy.get(resident).ref_cnt
+
+    assert manager.lookup(resident, _CTX) is True
+    assert primary._policy.get(resident).ref_cnt == baseline + 1
+
+    # The request never reached prepare_load() this step.
+    manager.on_schedule_end()
+    assert primary._policy.get(resident).ref_cnt == baseline
+    assert not manager._fused_load_resident_pins
+
+    # Next step the request looks it up again and re-pins it.
+    assert manager.lookup(resident, _CTX) is True
+    assert primary._policy.get(resident).ref_cnt == baseline + 1
+
+
+def test_fused_load_step_end_keeps_pins_claimed_by_a_load():
+    """A pin consumed by prepare_load() is owned by that LOAD, not the step."""
+    manager, primary, secondary = _fused_manager(num_blocks=2)
+    resident = to_keys(range(1))[0]
+
+    out = manager.prepare_store([resident], _CTX)
+    assert out is not None
+    manager.complete_store([resident], _CTX, success=True)
+    baseline = primary._policy.get(resident).ref_cnt
+
+    assert manager.lookup(resident, _CTX) is True
+    manager.prepare_load([resident], _CTX)
+    # prepare_load() took ownership, so step end must not drop the ref_cnt.
+    manager.on_schedule_end()
+    assert primary._policy.get(resident).ref_cnt == baseline + 1
+
+    manager.complete_load({resident}, _CTX)
+    assert primary._policy.get(resident).ref_cnt == baseline
+
+
 def test_fused_load_failure_releases_the_reserved_slot():
     """A failed LOAD must not publish a block the worker never filled."""
     manager, primary, secondary = _fused_manager(num_blocks=2)
