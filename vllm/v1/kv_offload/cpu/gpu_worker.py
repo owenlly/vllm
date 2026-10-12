@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -71,6 +72,7 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    submitted_at: float | None = None
 
 
 def compute_sub_block_ptrs(
@@ -192,6 +194,10 @@ def _canonical_block_sizes(
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
+    if os.getenv("CVM_KV_FORCE_UNPINNED") == "1":
+        logger.info("Skipping mmap host registration for unpinned KV comparison")
+        return
+
     if not current_platform.is_cuda_alike():
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
@@ -205,6 +211,15 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
+        if current_platform.is_cuda():
+            # CC rejects host registration. Clear the runtime's sticky error
+            # before continuing with the documented unpinned-DMA fallback.
+            import ctypes
+
+            # Use the same CUDA runtime soname as the installed PyTorch build.
+            # cuda-python may load a different runtime and clear another TLS slot.
+            major = torch.version.cuda.split(".", 1)[0]
+            ctypes.CDLL(f"libcudart.so.{major}").cudaGetLastError()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
@@ -297,6 +312,13 @@ class SingleDirectionOffloadingHandler:
             cpu_tensors if gpu_to_cpu else gpu_tensors
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
+        # GPU CC can produce invalid CUDA event durations. This opt-in clock
+        # measures submission-to-observed-completion, including queue/poll delay.
+        self._host_transfer_timing = os.getenv("CVM_KV_TRANSFER_HOST_TIMING") == "1"
+        if self._host_transfer_timing:
+            logger.info(
+                "KV transfer timing: host monotonic (includes queue/poll delay)"
+            )
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu
@@ -626,12 +648,12 @@ class SingleDirectionOffloadingHandler:
         start_event = (
             self._event_pool.pop()
             if self._event_pool
-            else torch.Event(enable_timing=True)
+            else torch.Event(enable_timing=not self._host_transfer_timing)
         )
         end_event = (
             self._event_pool.pop()
             if self._event_pool
-            else torch.Event(enable_timing=True)
+            else torch.Event(enable_timing=not self._host_transfer_timing)
         )
 
         # Stores must wait for the model to finish writing the KV they read.
@@ -640,6 +662,7 @@ class SingleDirectionOffloadingHandler:
         # the step being scheduled and cannot retract zeroing shipped in an
         # earlier step for a since-reallocated block; with async scheduling
         # nothing else orders that zeroing against this copy.
+        submitted_at = time.monotonic() if self._host_transfer_timing else None
         stream.wait_stream(current_platform.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
@@ -675,6 +698,7 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                submitted_at=submitted_at,
             )
         )
 
@@ -686,8 +710,10 @@ class SingleDirectionOffloadingHandler:
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
             transfer_time = (
-                transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-            )  # elapsed_time is in milliseconds
+                time.monotonic() - transfer.submitted_at
+                if transfer.submitted_at is not None
+                else transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+            )  # CUDA elapsed_time is milliseconds; host monotonic is seconds.
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
