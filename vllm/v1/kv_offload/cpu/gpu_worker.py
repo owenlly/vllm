@@ -32,6 +32,7 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
 )
+from vllm.v1.kv_offload.cpu.transfer_profile import get_transfer_profiler
 
 logger = init_logger(__name__)
 
@@ -314,6 +315,7 @@ class SingleDirectionOffloadingHandler:
         self.gpu_to_cpu: bool = gpu_to_cpu
         # GPU CC can produce invalid CUDA event durations. This opt-in clock
         # measures submission-to-observed-completion, including queue/poll delay.
+        self._transfer_profiler = get_transfer_profiler()
         self._host_transfer_timing = os.getenv("CVM_KV_TRANSFER_HOST_TIMING") == "1"
         if self._host_transfer_timing:
             logger.info(
@@ -534,6 +536,8 @@ class SingleDirectionOffloadingHandler:
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
+        profiler = self._transfer_profiler
+        entry_ns = time.monotonic_ns() if profiler else 0
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
@@ -642,6 +646,7 @@ class SingleDirectionOffloadingHandler:
         dst = dst[:op_idx]
         sizes = sizes[:op_idx]
 
+        prepared_ns = time.monotonic_ns() if profiler else 0
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
@@ -677,7 +682,19 @@ class SingleDirectionOffloadingHandler:
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
         with current_platform.stream(stream):
+            gpu_ticket = (
+                profiler.gpu_begin(
+                    "transfer",
+                    job_id=job_id,
+                    direction="D2H" if self.gpu_to_cpu else "H2D",
+                    num_bytes=num_transfer_bytes,
+                )
+                if profiler
+                else None
+            )
             start_event.record(stream)
+            api_start_ns = time.monotonic_ns() if profiler else 0
+            api_cpu_start_ns = time.thread_time_ns() if profiler else 0
             if op_idx > 0:
                 self._swap_blocks_batch(
                     src,
@@ -685,7 +702,11 @@ class SingleDirectionOffloadingHandler:
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
+            api_cpu_end_ns = time.thread_time_ns() if profiler else 0
+            api_end_ns = time.monotonic_ns() if profiler else 0
             end_event.record(stream)
+            if profiler:
+                profiler.gpu_end(gpu_ticket)
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -702,6 +723,24 @@ class SingleDirectionOffloadingHandler:
             )
         )
 
+        if profiler:
+            profiler.emit(
+                "submit",
+                job_id=job_id,
+                direction="D2H" if self.gpu_to_cpu else "H2D",
+                entry_ns=entry_ns,
+                prepared_ns=prepared_ns,
+                api_start_ns=api_start_ns,
+                api_end_ns=api_end_ns,
+                api_thread_cpu_ns=api_cpu_end_ns - api_cpu_start_ns,
+                num_bytes=num_transfer_bytes,
+                descriptors=op_idx,
+                queued_jobs=len(self._transfers) - 1,
+                copy_impl=getattr(self._swap_blocks_batch, "__name__", "partial"),
+                **profiler.adjacency(
+                    all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx]
+                ),
+            )
         # success
         return True
 
@@ -709,8 +748,15 @@ class SingleDirectionOffloadingHandler:
         results: list[TransferResult] = []
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
+            observed_at = time.monotonic() if transfer.submitted_at is not None else 0
+            if transfer_profiler := self._transfer_profiler:
+                transfer_profiler.emit(
+                    "observed_complete",
+                    job_id=transfer.job_id,
+                    direction="D2H" if self.gpu_to_cpu else "H2D",
+                )
             transfer_time = (
-                time.monotonic() - transfer.submitted_at
+                observed_at - transfer.submitted_at
                 if transfer.submitted_at is not None
                 else transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # CUDA elapsed_time is milliseconds; host monotonic is seconds.
@@ -735,7 +781,15 @@ class SingleDirectionOffloadingHandler:
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
+                wait_start_ns = time.monotonic_ns() if self._transfer_profiler else 0
                 event.synchronize()
+                if self._transfer_profiler:
+                    self._transfer_profiler.emit(
+                        "explicit_wait",
+                        job_id=job_id,
+                        direction="D2H" if self.gpu_to_cpu else "H2D",
+                        wait_start_ns=wait_start_ns,
+                    )
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
@@ -754,6 +808,12 @@ class SingleDirectionOffloadingHandler:
                 sync_error = e
                 break
             self._transfers.popleft()
+            if self._transfer_profiler:
+                self._transfer_profiler.emit(
+                    "shutdown_complete",
+                    job_id=transfer.job_id,
+                    direction="D2H" if self.gpu_to_cpu else "H2D",
+                )
 
         self._transfer_events.clear()
         self._stream_pool.clear()

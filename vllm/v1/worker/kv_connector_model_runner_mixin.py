@@ -4,6 +4,7 @@
 Define KV connector functionality mixin for model runners.
 """
 
+import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.v1.kv_offload.cpu.transfer_profile import get_transfer_profiler
 from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
@@ -83,14 +85,28 @@ class KVConnectorModelRunnerMixin:
         # zeroing. Sync loads feed this step's forward so must precede it;
         # otherwise start (async) loads after the forward launch, keeping
         # their host-side submission cost off the critical path.
+        profiler = get_transfer_profiler()
+        connector_entry_ns = time.monotonic_ns() if profiler else 0
         start_after_forward = not scheduler_output.has_sync_kv_loads
         if not start_after_forward:
             kv_connector.start_load_kv(get_forward_context())
+        gpu_ticket = (
+            profiler.gpu_begin(
+                "forward", scheduled_tokens=scheduler_output.total_num_scheduled_tokens
+            )
+            if profiler
+            else None
+        )
+        forward_entry_ns = time.monotonic_ns() if profiler else 0
         try:
             yield output
         finally:
+            forward_return_ns = time.monotonic_ns() if profiler else 0
+            if profiler:
+                profiler.gpu_end(gpu_ticket)
             if start_after_forward:
                 kv_connector.start_load_kv(get_forward_context())
+            transfers_return_ns = time.monotonic_ns() if profiler else 0
             if wait_for_save and not defer_finalize:
                 kv_connector.wait_for_save()
 
@@ -105,3 +121,14 @@ class KVConnectorModelRunnerMixin:
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()
+            if profiler:
+                profiler.emit(
+                    "forward_context",
+                    connector_entry_ns=connector_entry_ns,
+                    forward_entry_ns=forward_entry_ns,
+                    forward_return_ns=forward_return_ns,
+                    transfers_return_ns=transfers_return_ns,
+                    async_loads=start_after_forward,
+                    scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                    scheduled_requests=len(scheduler_output.num_scheduled_tokens),
+                )
